@@ -119,6 +119,10 @@ _app_log: list[str] = []
 _connected_clients: int = 0
 _request_count: int = 0
 
+# Continuous screen capture — background thread keeps latest frame hot
+_screen_frame: bytes | None = None
+_screen_running = False
+
 def _log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -132,19 +136,39 @@ def _log(msg: str):
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── Screen ────────────────────────────────────────────────────────────────────
-def capture_screen(monitor: int = 0, region: dict | None = None) -> bytes:
+def capture_screen(monitor: int = 0, region: dict | None = None, quality: int = 82) -> bytes:
     if region:
         box = (region["x"], region["y"],
                region["x"] + region["w"], region["y"] + region["h"])
         img = ImageGrab.grab(bbox=box, all_screens=True)
     else:
         img = ImageGrab.grab(all_screens=True)
+    # Downscale to 1920 wide max — faster transfer, AI sees everything anyway
+    if img.width > 1920:
+        ratio = 1920 / img.width
+        img = img.resize((1920, int(img.height * ratio)), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=quality)
     return buf.getvalue()
 
 def capture_screen_b64(**kw) -> str:
     return base64.b64encode(capture_screen(**kw)).decode()
+
+def _screen_loop():
+    """Background thread: keeps _screen_frame fresh at ~2fps."""
+    global _screen_frame, _screen_running
+    while _screen_running:
+        try:
+            _screen_frame = capture_screen(quality=78)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+def _start_screen_loop():
+    global _screen_running
+    if not _screen_running:
+        _screen_running = True
+        threading.Thread(target=_screen_loop, daemon=True).start()
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 def _camera_loop(device: int, fps: int):
@@ -196,7 +220,7 @@ def speak(text: str, rate: int = 175, voice: str = ""):
                 subprocess.run(["powershell", "-Command",
                     f'Add-Type -AssemblyName System.Speech; '
                     f'$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; '
-                    f'$s.Speak("{text}")'], capture_output=True)
+                    f'$s.Speak("{text}")'], capture_output=True, **_NO_WIN)
     threading.Thread(target=_run, daemon=True).start()
 
 # ── Audio record ──────────────────────────────────────────────────────────────
@@ -219,11 +243,14 @@ def record_audio(seconds: float, rate: int = 44100, channels: int = 1) -> bytes:
     return buf.getvalue()
 
 # ── Shell ─────────────────────────────────────────────────────────────────────
+_NO_WIN = {"creationflags": 0x08000000} if sys.platform == "win32" else {}  # CREATE_NO_WINDOW
+
 def shell_exec(cmd: str, cwd: str = None, timeout: int = 30) -> dict:
     result = subprocess.run(
         cmd, shell=True, capture_output=True, text=True,
         cwd=cwd, timeout=timeout,
-        env={**os.environ}
+        env={**os.environ},
+        **_NO_WIN
     )
     return {"stdout": result.stdout, "stderr": result.stderr, "rc": result.returncode}
 
@@ -326,7 +353,7 @@ def list_windows() -> list:
             'Select-Object Name,Id,MainWindowTitle | ConvertTo-Json'
         )
         r = subprocess.run(["powershell", "-Command", ps],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, **_NO_WIN)
         data = json.loads(r.stdout or "[]")
         if isinstance(data, dict):
             data = [data]
@@ -360,7 +387,7 @@ def type_text(text: str) -> dict:
     else:
         # PowerShell SendKeys
         ps = f'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("{text}")'
-        subprocess.run(["powershell", "-Command", ps], capture_output=True)
+        subprocess.run(["powershell", "-Command", ps], capture_output=True, **_NO_WIN)
     return {"typed": text}
 
 def send_key(key: str) -> dict:
@@ -370,7 +397,7 @@ def send_key(key: str) -> dict:
         return {"key": key}
     if IS_WINDOWS:
         ps = f'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("{key}")'
-        subprocess.run(["powershell", "-Command", ps], capture_output=True)
+        subprocess.run(["powershell", "-Command", ps], capture_output=True, **_NO_WIN)
         return {"key": key}
     return {"error": "Not supported"}
 
@@ -383,7 +410,7 @@ def focus_window(title: str) -> dict:
         f'$p = Get-Process | Where-Object {{$_.MainWindowTitle -like "*{title}*"}} | Select-Object -First 1; '
         f'if ($p) {{ [Win32]::SetForegroundWindow($p.MainWindowHandle) }}'
     )
-    subprocess.run(["powershell", "-Command", ps], capture_output=True)
+    subprocess.run(["powershell", "-Command", ps], capture_output=True, **_NO_WIN)
     return {"focused": title}
 
 # ── Tunnel ────────────────────────────────────────────────────────────────────
@@ -479,12 +506,22 @@ def api_screen():
         region = {k: int(request.args[k]) for k in ("x","y","w","h")}
     return _ok({"jpeg_b64": capture_screen_b64(region=region)})
 
+@api.route("/screen/latest")
+def api_screen_latest():
+    """Returns latest cached screen frame as raw JPEG — fast, no base64 overhead.
+    AI can reference this URL as an image directly."""
+    global _screen_frame
+    if _screen_frame is None:
+        _screen_frame = capture_screen()
+    return Response(_screen_frame, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
 @api.route("/screen/stream")
 def api_screen_stream():
     """MJPEG stream of screen — open in browser or img tag."""
     def gen():
         while True:
-            frame = capture_screen()
+            frame = _screen_frame or capture_screen()
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
             time.sleep(0.1)  # 10fps
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -732,14 +769,14 @@ def api_clipboard():
     if request.method == "GET":
         if IS_WINDOWS:
             r = subprocess.run(["powershell", "-Command", "Get-Clipboard"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, **_NO_WIN)
             return _ok(r.stdout.strip())
         return _err("Windows only")
     d = request.json or {}
     text = d.get("text","")
     if IS_WINDOWS:
         subprocess.run(["powershell", "-Command", f"Set-Clipboard '{text}'"],
-                       capture_output=True)
+                       capture_output=True, **_NO_WIN)
     return _ok("set")
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -797,20 +834,24 @@ _MCP_TOOLS = [
      "inputSchema":{"type":"object","properties":{},"required":[]}},
 ]
 
-def _mcp_call_tool(name: str, args: dict) -> str:
-    """Execute a tool call and return result as text."""
+def _mcp_call_tool(name: str, args: dict) -> list:
+    """Execute a tool call and return MCP content blocks list."""
     try:
         if name == "screen_capture":
-            b64 = capture_screen_b64(region=args.get("region"))
-            return f"Screenshot captured. JPEG base64 ({len(b64)} chars):\n{b64[:200]}..."
+            # Use cached frame for speed, fall back to live capture
+            frame = _screen_frame or capture_screen(region=args.get("region"))
+            if args.get("region"):
+                frame = capture_screen(region=args["region"])
+            b64 = base64.b64encode(frame).decode()
+            return [{"type": "image", "data": b64, "mimeType": "image/jpeg"}]
         elif name == "shell_exec":
             r = shell_exec(args["cmd"], args.get("cwd"), int(args.get("timeout", 30)))
-            return json.dumps(r, indent=2)
+            return [{"type":"text","text":json.dumps(r, indent=2)}]
         elif name == "fs_read":
             p = Path(args["path"])
             if args.get("binary"):
-                return base64.b64encode(p.read_bytes()).decode()
-            return p.read_text(errors="replace")
+                return [{"type":"text","text":base64.b64encode(p.read_bytes()).decode()}]
+            return [{"type":"text","text":p.read_text(errors="replace")}]
         elif name == "fs_write":
             p = Path(args["path"])
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -820,13 +861,13 @@ def _mcp_call_tool(name: str, args: dict) -> str:
             else:
                 with open(p, mode) as f:
                     f.write(args["content"])
-            return f"Written: {p}"
+            return [{"type":"text","text":f"Written: {p}"}]
         elif name == "fs_list":
             p = Path(args["path"])
             entries = [{"name": i.name, "type": "dir" if i.is_dir() else "file",
                         "size": i.stat().st_size if i.is_file() else 0}
                        for i in p.iterdir()]
-            return json.dumps(entries, indent=2)
+            return [{"type":"text","text":json.dumps(entries, indent=2)}]
         elif name == "fs_delete":
             p = Path(args["path"])
             if p.is_dir() and args.get("recursive"):
@@ -835,71 +876,75 @@ def _mcp_call_tool(name: str, args: dict) -> str:
                 p.rmdir()
             else:
                 p.unlink()
-            return f"Deleted: {p}"
+            return [{"type":"text","text":f"Deleted: {p}"}]
         elif name == "speak":
             speak(args["text"], int(args.get("rate", 175)), args.get("voice", ""))
-            return "Speaking..."
+            return [{"type":"text","text":"Speaking..."}]
         elif name == "ui_tree":
-            return json.dumps(get_ui_tree(args.get("window"), int(args.get("depth", 3))), indent=2)
+            return [{"type":"text","text":json.dumps(get_ui_tree(args.get("window"), int(args.get("depth", 3))), indent=2)}]
         elif name == "ui_windows":
-            return json.dumps(list_windows(), indent=2)
+            return [{"type":"text","text":json.dumps(list_windows(), indent=2)}]
         elif name == "ui_click":
-            return json.dumps(click_ui_element(x=args.get("x"), y=args.get("y")))
+            return [{"type":"text","text":json.dumps(click_ui_element(x=args.get("x"), y=args.get("y")))}]
         elif name == "ui_type":
-            return json.dumps(type_text(args.get("text", "")))
+            return [{"type":"text","text":json.dumps(type_text(args.get("text", "")))}]
         elif name == "ui_key":
-            return json.dumps(send_key(args.get("key", "")))
+            return [{"type":"text","text":json.dumps(send_key(args.get("key", "")))}]
         elif name == "ui_focus":
-            return json.dumps(focus_window(args.get("title", "")))
+            return [{"type":"text","text":json.dumps(focus_window(args.get("title", "")))}]
         elif name == "sysinfo":
             mem = psutil.virtual_memory()
             disk = psutil.disk_usage("/")
-            return json.dumps({
+            return [{"type":"text","text":json.dumps({
                 "os": platform.platform(), "hostname": socket.gethostname(),
                 "cpu_percent": psutil.cpu_percent(interval=0.3), "cpu_cores": psutil.cpu_count(),
                 "memory": {"total_gb": round(mem.total/1e9,1), "used_gb": round(mem.used/1e9,1), "percent": mem.percent},
                 "disk": {"total_gb": round(disk.total/1e9,1), "used_gb": round(disk.used/1e9,1), "percent": disk.percent},
-            }, indent=2)
+            }, indent=2)}]
         elif name == "processes":
             flt = args.get("filter", "").lower()
             procs = [p.info for p in psutil.process_iter(["pid","name","status","cpu_percent","memory_percent"])
                      if not flt or flt in (p.info.get("name") or "").lower()]
-            return json.dumps(procs[:100], indent=2)
+            return [{"type":"text","text":json.dumps(procs[:100], indent=2)}]
         elif name == "process_kill":
             if args.get("pid"):
                 os.kill(int(args["pid"]), 9)
-                return f"Killed PID {args['pid']}"
+                return [{"type":"text","text":f"Killed PID {args['pid']}"}]
             killed = []
             for proc in psutil.process_iter(["pid","name"]):
                 if args.get("name","").lower() in (proc.info.get("name") or "").lower():
                     os.kill(proc.pid, 9); killed.append(proc.pid)
-            return f"Killed: {killed}"
+            return [{"type":"text","text":f"Killed: {killed}"}]
         elif name == "clipboard_get":
             if IS_WINDOWS:
-                r = subprocess.run(["powershell","-Command","Get-Clipboard"], capture_output=True, text=True)
-                return r.stdout.strip()
-            return "Windows only"
+                kwargs = {"creationflags": 0x08000000} if IS_WINDOWS else {}
+                r = subprocess.run(["powershell","-Command","Get-Clipboard"],
+                                   capture_output=True, text=True, **kwargs)
+                return [{"type":"text","text":r.stdout.strip()}]
+            return [{"type":"text","text":"Windows only"}]
         elif name == "clipboard_set":
             if IS_WINDOWS:
-                subprocess.run(["powershell","-Command",f"Set-Clipboard '{args.get('text','')}'"], capture_output=True)
-            return "Set"
+                kwargs = {"creationflags": 0x08000000}
+                subprocess.run(["powershell","-Command",f"Set-Clipboard '{args.get('text','')}'"],
+                               capture_output=True, **kwargs)
+            return [{"type":"text","text":"Set"}]
         elif name == "camera_snap":
             frame = camera_snap(int(args.get("device", 0)))
             b64 = base64.b64encode(frame).decode()
-            return f"Webcam photo. JPEG base64 ({len(b64)} chars):\n{b64[:200]}..."
+            return [{"type": "image", "data": b64, "mimeType": "image/jpeg"}]
         elif name == "tunnel_start":
             def _run():
                 start_tunnel(_api_port, args.get("provider","cloudflare"),
                              args.get("cf_token",""), args.get("ngrok_token",""), args.get("ngrok_domain",""))
             threading.Thread(target=_run, daemon=True).start()
-            return "Tunnel starting..."
+            return [{"type":"text","text":"Tunnel starting..."}]
         elif name == "tunnel_status":
             running = _tunnel_proc is not None and _tunnel_proc.poll() is None
-            return json.dumps({"running": running, "url": _tunnel_url})
+            return [{"type":"text","text":json.dumps({"running": running, "url": _tunnel_url})}]
         else:
-            return f"Unknown tool: {name}"
+            return [{"type":"text","text":f"Unknown tool: {name}"}]
     except Exception as e:
-        return f"Error: {e}"
+        return [{"type":"text","text":f"Error: {e}"}]
 
 def _mcp_handle(msg: dict) -> dict | None:
     """Handle a JSON-RPC message, return response dict or None for notifications."""
@@ -926,22 +971,8 @@ def _mcp_handle(msg: dict) -> dict | None:
         name = params.get("name","")
         args = params.get("arguments", {})
         _log(f"MCP tool call: {name}")
-        result_text = _mcp_call_tool(name, args)
-        # Return image for screen/camera
-        if name in ("screen_capture", "camera_snap") and result_text:
-            # extract the full b64 — crude but works
-            lines = result_text.split("\n")
-            b64_part = lines[-1] if len(lines) > 1 else ""
-            # get full b64 from actual capture
-            try:
-                if name == "screen_capture":
-                    full_b64 = capture_screen_b64(region=args.get("region"))
-                else:
-                    full_b64 = base64.b64encode(camera_snap(int(args.get("device",0)))).decode()
-                return ok({"content":[{"type":"image","data":full_b64,"mimeType":"image/jpeg"}]})
-            except Exception:
-                pass
-        return ok({"content":[{"type":"text","text":result_text}]})
+        content = _mcp_call_tool(name, args)
+        return ok({"content": content})
     elif method == "ping":
         return ok({})
     else:
@@ -1317,6 +1348,10 @@ if __name__ == "__main__":
     _log("vyro-mcp starting...")
     _log(f"Platform: {platform.platform()}")
     _log(f"Python: {sys.version.split()[0]}")
+
+    # Start continuous screen capture loop (keeps frame hot for fast AI access)
+    _start_screen_loop()
+    _log("Screen capture loop started")
 
     # Start Flask in background thread
     api_thread = threading.Thread(target=_run_api, daemon=True)
