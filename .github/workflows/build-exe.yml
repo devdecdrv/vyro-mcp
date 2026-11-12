@@ -1,4 +1,3 @@
-"""
 vyro-mcp — Windows AI Control Server
 Full GUI dashboard + HTTP API. AI connects via HTTPS tunnel.
 Run as Administrator for full access.
