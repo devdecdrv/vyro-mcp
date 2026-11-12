@@ -1,13 +1,13 @@
-#!/usr/bin/env python3
 """
-vyro-mcp — Full root/kernel/hardware MCP server
-Gives an AI eyes, ears, mouth, hands, and full system control.
-Run as root for kernel-level access.
+vyro-mcp — Windows AI Control Server
+Full GUI dashboard + HTTP API. AI connects via HTTPS tunnel.
+Run as Administrator for full access.
 """
 
 import asyncio
 import base64
 import ctypes
+import io
 import json
 import logging
 import os
@@ -22,982 +22,1058 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# ── third-party (installed at startup) ──────────────────────────────────────
-try:
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-    from mcp import types
-except ImportError:
-    print("Installing mcp...", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "mcp", "-q",
-                           "--break-system-packages"])
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-    from mcp import types
+# ── Auto-install dependencies ─────────────────────────────────────────────────
+def _pip(*pkgs):
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--quiet", *pkgs],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
 
-# Optional heavy deps — imported lazily
-cv2 = None
-pyaudio = None
-pyttsx3 = None
-psutil = None
+def _ensure_deps():
+    missing = []
+    checks = {
+        "flask": "flask",
+        "flask_cors": "flask-cors",
+        "PIL": "pillow",
+        "cv2": "opencv-python",
+        "psutil": "psutil",
+        "pyttsx3": "pyttsx3",
+        "pyaudio": "pyaudio",
+    }
+    for mod, pkg in checks.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"Installing: {', '.join(missing)}")
+        _pip(*missing)
+
+_ensure_deps()
+
+# ── Imports after ensure ──────────────────────────────────────────────────────
+import tkinter as tk
+from tkinter import ttk, scrolledtext, font as tkfont
+import threading
+
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+from PIL import Image, ImageGrab, ImageTk
+import psutil
+import pyttsx3
+
+# Optional
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+try:
+    import pyaudio
+    HAS_AUDIO = True
+except ImportError:
+    HAS_AUDIO = False
+
+# Windows-only
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    import ctypes
+    import winreg
+    try:
+        import comtypes.client
+        from comtypes.gen import UIAutomationClient as UIA
+        HAS_UIA = True
+    except Exception:
+        HAS_UIA = False
+    try:
+        import pygetwindow as gw
+        HAS_GW = True
+    except Exception:
+        HAS_GW = False
+    try:
+        import pyautogui
+        HAS_GUI = True
+        pyautogui.FAILSAFE = False
+    except Exception:
+        HAS_GUI = False
+else:
+    HAS_UIA = HAS_GW = HAS_GUI = False
 
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger("vyro-mcp")
 
-# ── server instance ──────────────────────────────────────────────────────────
-app = Server("vyro-mcp")
-
-# ── global state ─────────────────────────────────────────────────────────────
-_camera_stream: dict = {}          # thread + frame buffer
-_audio_stream: dict = {}           # thread + audio buffer
+# ── Global state ───────────────────────────────────────────────────────────────
+_camera_running = False
+_camera_frame: bytes | None = None
 _tunnel_proc: subprocess.Popen | None = None
 _tunnel_url: str = ""
+_api_port: int = 7832
+_tts_engine = None
+_app_log: list[str] = []
+_connected_clients: int = 0
+_request_count: int = 0
 
-
-# ════════════════════════════════════════════════════════════════════════════
-#  TOOL REGISTRY
-# ════════════════════════════════════════════════════════════════════════════
-@app.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
-        # ── EYES ────────────────────────────────────────────────────────────
-        types.Tool(
-            name="camera_snapshot",
-            description="Capture a single frame from the webcam. Returns base64 JPEG.",
-            inputSchema={"type": "object", "properties": {
-                "device": {"type": "integer", "default": 0,
-                           "description": "Camera device index (0 = default)"},
-                "width":  {"type": "integer", "default": 1280},
-                "height": {"type": "integer", "default": 720},
-            }},
-        ),
-        types.Tool(
-            name="camera_stream_start",
-            description="Start continuous camera capture. Frames available via camera_get_frame.",
-            inputSchema={"type": "object", "properties": {
-                "device": {"type": "integer", "default": 0},
-                "fps":    {"type": "integer", "default": 10},
-            }},
-        ),
-        types.Tool(
-            name="camera_get_frame",
-            description="Get the latest frame from the running stream as base64 JPEG.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="camera_stream_stop",
-            description="Stop the camera stream.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="screen_capture",
-            description="Take a screenshot of the display. Returns base64 PNG.",
-            inputSchema={"type": "object", "properties": {
-                "display": {"type": "integer", "default": 0},
-            }},
-        ),
-
-        # ── EARS ────────────────────────────────────────────────────────────
-        types.Tool(
-            name="audio_record",
-            description="Record audio from the microphone for N seconds. Returns base64 WAV.",
-            inputSchema={"type": "object", "required": ["seconds"], "properties": {
-                "seconds":     {"type": "number"},
-                "sample_rate": {"type": "integer", "default": 44100},
-                "channels":    {"type": "integer", "default": 1},
-            }},
-        ),
-        types.Tool(
-            name="audio_stream_start",
-            description="Start continuous microphone capture.",
-            inputSchema={"type": "object", "properties": {
-                "sample_rate": {"type": "integer", "default": 16000},
-            }},
-        ),
-        types.Tool(
-            name="audio_stream_stop",
-            description="Stop the microphone stream.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-
-        # ── MOUTH ───────────────────────────────────────────────────────────
-        types.Tool(
-            name="speak",
-            description="Speak text aloud via TTS (pyttsx3 / espeak).",
-            inputSchema={"type": "object", "required": ["text"], "properties": {
-                "text":  {"type": "string"},
-                "rate":  {"type": "integer", "default": 175,
-                          "description": "Words per minute"},
-                "voice": {"type": "string", "default": "",
-                          "description": "Voice name or empty for default"},
-            }},
-        ),
-        types.Tool(
-            name="audio_play",
-            description="Play a local audio file.",
-            inputSchema={"type": "object", "required": ["path"], "properties": {
-                "path": {"type": "string"},
-            }},
-        ),
-
-        # ── HANDS (filesystem) ──────────────────────────────────────────────
-        types.Tool(
-            name="fs_read",
-            description="Read a file. Returns text or base64 for binary.",
-            inputSchema={"type": "object", "required": ["path"], "properties": {
-                "path":   {"type": "string"},
-                "binary": {"type": "boolean", "default": False},
-                "offset": {"type": "integer", "default": 0},
-                "length": {"type": "integer", "default": -1},
-            }},
-        ),
-        types.Tool(
-            name="fs_write",
-            description="Write content to a file.",
-            inputSchema={"type": "object", "required": ["path", "content"], "properties": {
-                "path":    {"type": "string"},
-                "content": {"type": "string"},
-                "binary":  {"type": "boolean", "default": False,
-                            "description": "If true, content is base64"},
-                "append":  {"type": "boolean", "default": False},
-            }},
-        ),
-        types.Tool(
-            name="fs_list",
-            description="List directory contents.",
-            inputSchema={"type": "object", "required": ["path"], "properties": {
-                "path":      {"type": "string"},
-                "recursive": {"type": "boolean", "default": False},
-            }},
-        ),
-        types.Tool(
-            name="fs_delete",
-            description="Delete a file or directory.",
-            inputSchema={"type": "object", "required": ["path"], "properties": {
-                "path": {"type": "string"},
-                "recursive": {"type": "boolean", "default": False},
-            }},
-        ),
-        types.Tool(
-            name="fs_move",
-            description="Move / rename a file or directory.",
-            inputSchema={"type": "object", "required": ["src", "dst"], "properties": {
-                "src": {"type": "string"},
-                "dst": {"type": "string"},
-            }},
-        ),
-        types.Tool(
-            name="fs_copy",
-            description="Copy a file or directory.",
-            inputSchema={"type": "object", "required": ["src", "dst"], "properties": {
-                "src": {"type": "string"},
-                "dst": {"type": "string"},
-            }},
-        ),
-
-        # ── HANDS (shell / process) ─────────────────────────────────────────
-        types.Tool(
-            name="shell_exec",
-            description="Execute a shell command. Full root access.",
-            inputSchema={"type": "object", "required": ["cmd"], "properties": {
-                "cmd":     {"type": "string"},
-                "cwd":     {"type": "string", "default": "/"},
-                "timeout": {"type": "integer", "default": 30},
-                "env":     {"type": "object", "default": {}},
-            }},
-        ),
-        types.Tool(
-            name="process_list",
-            description="List running processes.",
-            inputSchema={"type": "object", "properties": {
-                "filter": {"type": "string", "default": ""},
-            }},
-        ),
-        types.Tool(
-            name="process_kill",
-            description="Kill a process by PID or name.",
-            inputSchema={"type": "object", "properties": {
-                "pid":  {"type": "integer"},
-                "name": {"type": "string"},
-                "sig":  {"type": "integer", "default": 15},
-            }},
-        ),
-        types.Tool(
-            name="process_spawn",
-            description="Spawn a process in the background.",
-            inputSchema={"type": "object", "required": ["cmd"], "properties": {
-                "cmd":  {"type": "array", "items": {"type": "string"}},
-                "cwd":  {"type": "string", "default": "/"},
-                "env":  {"type": "object", "default": {}},
-            }},
-        ),
-
-        # ── HARDWARE / KERNEL ───────────────────────────────────────────────
-        types.Tool(
-            name="hw_info",
-            description="Return full hardware info: CPU, RAM, disks, GPU, network interfaces.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="mem_read",
-            description="Read physical memory at address (requires root + /dev/mem). Returns hex.",
-            inputSchema={"type": "object", "required": ["address", "length"], "properties": {
-                "address": {"type": "integer"},
-                "length":  {"type": "integer"},
-            }},
-        ),
-        types.Tool(
-            name="mem_write",
-            description="Write bytes to physical memory address (requires root + /dev/mem).",
-            inputSchema={"type": "object", "required": ["address", "data"], "properties": {
-                "address": {"type": "integer"},
-                "data":    {"type": "string", "description": "Hex string of bytes"},
-            }},
-        ),
-        types.Tool(
-            name="kernel_module_load",
-            description="Load a kernel module (insmod/modprobe).",
-            inputSchema={"type": "object", "required": ["module"], "properties": {
-                "module": {"type": "string"},
-                "params": {"type": "string", "default": ""},
-            }},
-        ),
-        types.Tool(
-            name="kernel_module_unload",
-            description="Unload a kernel module (rmmod).",
-            inputSchema={"type": "object", "required": ["module"], "properties": {
-                "module": {"type": "string"},
-            }},
-        ),
-        types.Tool(
-            name="kernel_sysctl",
-            description="Read or write a sysctl value.",
-            inputSchema={"type": "object", "required": ["key"], "properties": {
-                "key":   {"type": "string"},
-                "value": {"type": "string", "default": ""},
-            }},
-        ),
-        types.Tool(
-            name="gpio_write",
-            description="Write a value to a GPIO pin (Linux sysfs or /dev/gpiomem).",
-            inputSchema={"type": "object", "required": ["pin", "value"], "properties": {
-                "pin":   {"type": "integer"},
-                "value": {"type": "integer", "description": "0 or 1"},
-            }},
-        ),
-        types.Tool(
-            name="gpio_read",
-            description="Read a GPIO pin value.",
-            inputSchema={"type": "object", "required": ["pin"], "properties": {
-                "pin": {"type": "integer"},
-            }},
-        ),
-        types.Tool(
-            name="usb_list",
-            description="List connected USB devices.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="i2c_scan",
-            description="Scan an I2C bus for devices.",
-            inputSchema={"type": "object", "properties": {
-                "bus": {"type": "integer", "default": 1},
-            }},
-        ),
-
-        # ── NETWORK ─────────────────────────────────────────────────────────
-        types.Tool(
-            name="net_interfaces",
-            description="List network interfaces with IPs.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="net_scan",
-            description="Port-scan a host.",
-            inputSchema={"type": "object", "required": ["host"], "properties": {
-                "host":       {"type": "string"},
-                "ports":      {"type": "string", "default": "1-1024"},
-                "timeout_ms": {"type": "integer", "default": 300},
-            }},
-        ),
-        types.Tool(
-            name="net_packet_send",
-            description="Send a raw UDP/TCP packet.",
-            inputSchema={"type": "object", "required": ["host", "port", "data"], "properties": {
-                "host":     {"type": "string"},
-                "port":     {"type": "integer"},
-                "data":     {"type": "string", "description": "Hex or plain string"},
-                "protocol": {"type": "string", "default": "udp"},
-            }},
-        ),
-
-        # ── TUNNEL ──────────────────────────────────────────────────────────
-        types.Tool(
-            name="tunnel_start",
-            description="Start a tunnel to expose local port. Supports cloudflare (quick, no account) or ngrok (persistent with token).",
-            inputSchema={"type": "object", "required": ["port"], "properties": {
-                "port":      {"type": "integer"},
-                "provider":  {"type": "string", "default": "cloudflare",
-                              "description": "cloudflare | ngrok"},
-                "ngrok_token":    {"type": "string", "default": ""},
-                "ngrok_domain":   {"type": "string", "default": "",
-                                   "description": "Custom ngrok domain (paid)"},
-                "cf_token":       {"type": "string", "default": "",
-                                   "description": "Cloudflare tunnel token for persistent named tunnel"},
-            }},
-        ),
-        types.Tool(
-            name="tunnel_status",
-            description="Get current tunnel URL and status.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="tunnel_stop",
-            description="Stop the running tunnel.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-
-        # ── SYSTEM ──────────────────────────────────────────────────────────
-        types.Tool(
-            name="sys_info",
-            description="Return OS, uptime, load, memory, disk usage.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="sys_reboot",
-            description="Reboot the system.",
-            inputSchema={"type": "object", "properties": {
-                "delay_seconds": {"type": "integer", "default": 0},
-            }},
-        ),
-        types.Tool(
-            name="sys_shutdown",
-            description="Shutdown the system.",
-            inputSchema={"type": "object", "properties": {
-                "delay_seconds": {"type": "integer", "default": 0},
-            }},
-        ),
-        types.Tool(
-            name="clipboard_get",
-            description="Read the clipboard contents.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="clipboard_set",
-            description="Write text to the clipboard.",
-            inputSchema={"type": "object", "required": ["text"], "properties": {
-                "text": {"type": "string"},
-            }},
-        ),
-    ]
-
+def _log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    _app_log.append(line)
+    if len(_app_log) > 500:
+        _app_log.pop(0)
+    print(line)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  TOOL IMPLEMENTATIONS
+#  CORE CAPABILITIES
 # ════════════════════════════════════════════════════════════════════════════
 
-def _ok(data: Any) -> list[types.TextContent]:
-    if not isinstance(data, str):
-        data = json.dumps(data, default=str, indent=2)
-    return [types.TextContent(type="text", text=data)]
+# ── Screen ────────────────────────────────────────────────────────────────────
+def capture_screen(monitor: int = 0, region: dict | None = None) -> bytes:
+    if region:
+        box = (region["x"], region["y"],
+               region["x"] + region["w"], region["y"] + region["h"])
+        img = ImageGrab.grab(bbox=box, all_screens=True)
+    else:
+        img = ImageGrab.grab(all_screens=True)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
 
-def _err(msg: str) -> list[types.TextContent]:
-    return [types.TextContent(type="text", text=f"ERROR: {msg}")]
+def capture_screen_b64(**kw) -> str:
+    return base64.b64encode(capture_screen(**kw)).decode()
 
-
-# ── lazy imports ─────────────────────────────────────────────────────────────
-def _cv2():
-    global cv2
-    if cv2 is None:
-        try:
-            import cv2 as _c; cv2 = _c
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                   "opencv-python-headless", "-q",
-                                   "--break-system-packages"])
-            import cv2 as _c; cv2 = _c
-    return cv2
-
-def _psutil():
-    global psutil
-    if psutil is None:
-        try:
-            import psutil as _p; psutil = _p
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                   "psutil", "-q", "--break-system-packages"])
-            import psutil as _p; psutil = _p
-    return psutil
-
-def _pyaudio():
-    global pyaudio
-    if pyaudio is None:
-        try:
-            import pyaudio as _a; pyaudio = _a
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                   "pyaudio", "-q", "--break-system-packages"])
-            import pyaudio as _a; pyaudio = _a
-    return pyaudio
-
-def _pyttsx3():
-    global pyttsx3
-    if pyttsx3 is None:
-        try:
-            import pyttsx3 as _t; pyttsx3 = _t
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                   "pyttsx3", "-q", "--break-system-packages"])
-            import pyttsx3 as _t; pyttsx3 = _t
-    return pyttsx3
-
-
-# ── CAMERA ───────────────────────────────────────────────────────────────────
-def _grab_frame(device: int, width: int, height: int) -> bytes:
-    cv = _cv2()
-    cap = cv.VideoCapture(device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        raise RuntimeError("Could not read frame from camera")
-    _, buf = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 85])
-    return buf.tobytes()
-
-def _stream_loop(device: int, fps: int):
-    cv = _cv2()
-    cap = cv.VideoCapture(device)
+# ── Camera ────────────────────────────────────────────────────────────────────
+def _camera_loop(device: int, fps: int):
+    global _camera_running, _camera_frame
+    if not HAS_CV2:
+        return
+    cap = cv2.VideoCapture(device, cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     delay = 1.0 / fps
-    while _camera_stream.get("running"):
+    while _camera_running:
         ok, frame = cap.read()
         if ok:
-            _, buf = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
-            _camera_stream["frame"] = buf.tobytes()
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _camera_frame = buf.tobytes()
         time.sleep(delay)
     cap.release()
 
+def camera_snap(device: int = 0) -> bytes:
+    if not HAS_CV2:
+        raise RuntimeError("opencv not available")
+    cap = cv2.VideoCapture(device, cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError("Camera read failed")
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes()
 
-# ── AUDIO ────────────────────────────────────────────────────────────────────
-def _record_audio(seconds: float, sample_rate: int, channels: int) -> bytes:
-    import wave, io
-    pa = _pyaudio()
-    p = pa.PyAudio()
-    stream = p.open(format=pa.paInt16, channels=channels,
-                    rate=sample_rate, input=True,
-                    frames_per_buffer=1024)
+# ── TTS ───────────────────────────────────────────────────────────────────────
+def speak(text: str, rate: int = 175, voice: str = ""):
+    global _tts_engine
+    def _run():
+        global _tts_engine
+        try:
+            if _tts_engine is None:
+                _tts_engine = pyttsx3.init()
+            _tts_engine.setProperty("rate", rate)
+            if voice:
+                for v in _tts_engine.getProperty("voices"):
+                    if voice.lower() in v.name.lower():
+                        _tts_engine.setProperty("voice", v.id)
+                        break
+            _tts_engine.say(text)
+            _tts_engine.runAndWait()
+        except Exception as e:
+            log.error(f"TTS error: {e}")
+            if IS_WINDOWS:
+                subprocess.run(["powershell", "-Command",
+                    f'Add-Type -AssemblyName System.Speech; '
+                    f'$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+                    f'$s.Speak("{text}")'], capture_output=True)
+    threading.Thread(target=_run, daemon=True).start()
+
+# ── Audio record ──────────────────────────────────────────────────────────────
+def record_audio(seconds: float, rate: int = 44100, channels: int = 1) -> bytes:
+    if not HAS_AUDIO:
+        raise RuntimeError("pyaudio not available")
+    pa = pyaudio.PyAudio()
+    stream = pa.open(format=pyaudio.paInt16, channels=channels,
+                     rate=rate, input=True, frames_per_buffer=1024)
     frames = []
-    for _ in range(int(sample_rate / 1024 * seconds)):
-        frames.append(stream.read(1024))
-    stream.stop_stream(); stream.close(); p.terminate()
+    for _ in range(int(rate / 1024 * seconds)):
+        frames.append(stream.read(1024, exception_on_overflow=False))
+    stream.stop_stream(); stream.close(); pa.terminate()
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
+        wf.setframerate(rate)
         wf.writeframes(b"".join(frames))
     return buf.getvalue()
 
+# ── Shell ─────────────────────────────────────────────────────────────────────
+def shell_exec(cmd: str, cwd: str = None, timeout: int = 30) -> dict:
+    result = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True,
+        cwd=cwd, timeout=timeout,
+        env={**os.environ}
+    )
+    return {"stdout": result.stdout, "stderr": result.stderr, "rc": result.returncode}
 
-# ── TTS ───────────────────────────────────────────────────────────────────────
-def _speak(text: str, rate: int, voice: str):
-    # Try pyttsx3 first, fall back to espeak
+# ── Windows UI Automation ─────────────────────────────────────────────────────
+def get_ui_tree(window_title: str = None, depth: int = 3) -> dict:
+    """Walk the Windows UI Automation tree — gives AI access to every button,
+    text field, menu item, and control in any app."""
+    if not IS_WINDOWS:
+        return {"error": "Windows only"}
     try:
-        tts = _pyttsx3().init()
-        tts.setProperty("rate", rate)
-        if voice:
-            for v in tts.getProperty("voices"):
-                if voice.lower() in v.name.lower():
-                    tts.setProperty("voice", v.id)
-                    break
-        tts.say(text)
-        tts.runAndWait()
-    except Exception:
-        subprocess.run(["espeak", f"-s{rate}", text], check=False)
+        import comtypes
+        import comtypes.client
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import (
+            CUIAutomation, IUIAutomation, IUIAutomationElement,
+            TreeScope_Children, TreeScope_Subtree,
+            UIA_NamePropertyId, UIA_AutomationIdPropertyId,
+            UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
+            UIA_IsEnabledPropertyId, UIA_BoundingRectanglePropertyId,
+        )
+        uia = comtypes.client.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+            interface=IUIAutomation
+        )
 
+        def _elem_to_dict(elem, cur_depth):
+            if elem is None or cur_depth < 0:
+                return None
+            try:
+                name = elem.GetCurrentPropertyValue(UIA_NamePropertyId) or ""
+                aid  = elem.GetCurrentPropertyValue(UIA_AutomationIdPropertyId) or ""
+                cls  = elem.GetCurrentPropertyValue(UIA_ClassNamePropertyId) or ""
+                rect = elem.GetCurrentPropertyValue(UIA_BoundingRectanglePropertyId)
+                enabled = elem.GetCurrentPropertyValue(UIA_IsEnabledPropertyId)
+                node = {
+                    "name": str(name),
+                    "automation_id": str(aid),
+                    "class": str(cls),
+                    "enabled": bool(enabled),
+                    "rect": {"l": int(rect.left), "t": int(rect.top),
+                             "r": int(rect.right), "b": int(rect.bottom)}
+                    if rect else {},
+                }
+                if cur_depth > 0:
+                    children = []
+                    walker = uia.ControlViewWalker
+                    child = walker.GetFirstChildElement(elem)
+                    while child:
+                        d = _elem_to_dict(child, cur_depth - 1)
+                        if d:
+                            children.append(d)
+                        child = walker.GetNextSiblingElement(child)
+                    if children:
+                        node["children"] = children
+                return node
+            except Exception:
+                return None
 
-# ── TUNNEL ───────────────────────────────────────────────────────────────────
+        if window_title:
+            cond = uia.CreatePropertyCondition(UIA_NamePropertyId, window_title)
+            elem = uia.RootElement.FindFirst(TreeScope_Children, cond)
+            if elem is None:
+                # fuzzy search
+                walker = uia.ControlViewWalker
+                child = walker.GetFirstChildElement(uia.RootElement)
+                while child:
+                    n = child.GetCurrentPropertyValue(UIA_NamePropertyId) or ""
+                    if window_title.lower() in str(n).lower():
+                        elem = child
+                        break
+                    child = walker.GetNextSiblingElement(child)
+        else:
+            elem = uia.RootElement
+
+        return _elem_to_dict(elem, depth) or {"error": "Element not found"}
+    except Exception as e:
+        # Fallback: use powershell to dump window info
+        try:
+            ps = (
+                'Add-Type -AssemblyName UIAutomationClient; '
+                'Add-Type -AssemblyName UIAutomationTypes; '
+                '$ae=[System.Windows.Automation.AutomationElement]; '
+                '$root=$ae::RootElement; '
+                '$cond=$ae::ContentViewCondition; '
+                '$all=$root.FindAll([System.Windows.Automation.TreeScope]::Children,$cond); '
+                '$all | ForEach-Object { $_.Current.Name } | ConvertTo-Json'
+            )
+            r = subprocess.run(["powershell", "-Command", ps],
+                               capture_output=True, text=True, timeout=10)
+            return {"windows": json.loads(r.stdout or "[]")}
+        except Exception as e2:
+            return {"error": str(e2)}
+
+def list_windows() -> list:
+    if not IS_WINDOWS:
+        return []
+    try:
+        ps = (
+            'Get-Process | Where-Object {$_.MainWindowTitle} | '
+            'Select-Object Name,Id,MainWindowTitle | ConvertTo-Json'
+        )
+        r = subprocess.run(["powershell", "-Command", ps],
+                           capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "[]")
+        if isinstance(data, dict):
+            data = [data]
+        return data
+    except Exception as e:
+        return [{"error": str(e)}]
+
+def click_ui_element(automation_id: str = None, name: str = None,
+                     x: int = None, y: int = None) -> dict:
+    if not IS_WINDOWS:
+        return {"error": "Windows only"}
+    if x is not None and y is not None:
+        if HAS_GUI:
+            import pyautogui
+            pyautogui.click(x, y)
+            return {"clicked": f"coordinates ({x},{y})"}
+        else:
+            # Win32 SendInput
+            ctypes.windll.user32.SetCursorPos(x, y)
+            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LBUTTONDOWN
+            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LBUTTONUP
+            return {"clicked": f"coordinates ({x},{y})"}
+    return {"error": "Provide x,y coordinates or use UI tree to find element"}
+
+def type_text(text: str) -> dict:
+    if not IS_WINDOWS:
+        return {"error": "Windows only"}
+    if HAS_GUI:
+        import pyautogui
+        pyautogui.typewrite(text, interval=0.02)
+    else:
+        # PowerShell SendKeys
+        ps = f'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("{text}")'
+        subprocess.run(["powershell", "-Command", ps], capture_output=True)
+    return {"typed": text}
+
+def send_key(key: str) -> dict:
+    if HAS_GUI:
+        import pyautogui
+        pyautogui.press(key)
+        return {"key": key}
+    if IS_WINDOWS:
+        ps = f'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("{key}")'
+        subprocess.run(["powershell", "-Command", ps], capture_output=True)
+        return {"key": key}
+    return {"error": "Not supported"}
+
+def focus_window(title: str) -> dict:
+    if not IS_WINDOWS:
+        return {"error": "Windows only"}
+    ps = (
+        f'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; '
+        f'public class Win32 {{ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); }}\'; '
+        f'$p = Get-Process | Where-Object {{$_.MainWindowTitle -like "*{title}*"}} | Select-Object -First 1; '
+        f'if ($p) {{ [Win32]::SetForegroundWindow($p.MainWindowHandle) }}'
+    )
+    subprocess.run(["powershell", "-Command", ps], capture_output=True)
+    return {"focused": title}
+
+# ── Tunnel ────────────────────────────────────────────────────────────────────
 def _ensure_cloudflared():
     if shutil.which("cloudflared"):
-        return
-    arch = platform.machine()
-    url = (f"https://github.com/cloudflare/cloudflared/releases/latest/download/"
-           f"cloudflared-linux-{'arm64' if 'arm' in arch.lower() or 'aarch' in arch.lower() else 'amd64'}")
-    subprocess.check_call(["curl", "-fsSL", url, "-o", "/usr/local/bin/cloudflared"])
-    os.chmod("/usr/local/bin/cloudflared", 0o755)
+        return True
+    if IS_WINDOWS:
+        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+        dst = Path(os.environ.get("TEMP", "C:\\Temp")) / "cloudflared.exe"
+        import urllib.request
+        try:
+            urllib.request.urlretrieve(url, dst)
+            os.environ["PATH"] = str(dst.parent) + os.pathsep + os.environ["PATH"]
+            # copy to PATH
+            shutil.copy(dst, Path(sys.executable).parent / "cloudflared.exe")
+            return True
+        except Exception:
+            return False
+    return False
 
-def _ensure_ngrok():
-    if shutil.which("ngrok"):
-        return
-    arch = platform.machine()
-    pkg = f"ngrok-v3-stable-linux-{'arm64' if 'arm' in arch.lower() else 'amd64'}.tgz"
-    url = f"https://bin.equinox.io/c/bNyj1mQVY4c/{pkg}"
-    tmp = tempfile.mkdtemp()
-    subprocess.check_call(["curl", "-fsSL", url, "-o", f"{tmp}/ngrok.tgz"])
-    subprocess.check_call(["tar", "-xzf", f"{tmp}/ngrok.tgz", "-C", "/usr/local/bin"])
-    os.chmod("/usr/local/bin/ngrok", 0o755)
-
-def _start_cloudflare_tunnel(port: int, cf_token: str) -> str:
+def start_tunnel(port: int, provider: str = "cloudflare",
+                 cf_token: str = "", ngrok_token: str = "",
+                 ngrok_domain: str = "") -> str:
     global _tunnel_proc, _tunnel_url
-    _ensure_cloudflared()
-    if cf_token:
-        # Named persistent tunnel via token
-        cmd = ["cloudflared", "tunnel", "--no-autoupdate", "run",
-               "--token", cf_token]
-    else:
-        # Quick tunnel — no account needed
-        cmd = ["cloudflared", "tunnel", "--no-autoupdate",
-               "--url", f"http://localhost:{port}"]
-    _tunnel_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1)
-    # Read until we see the URL
-    for line in _tunnel_proc.stdout:
-        m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", line)
-        if m:
-            _tunnel_url = m.group(0)
-            break
-        # Named tunnel URL pattern
-        m2 = re.search(r"https://\S+\.cfargotunnel\.com", line)
-        if m2:
-            _tunnel_url = m2.group(0)
-            break
-        # Catch any https URL
-        m3 = re.search(r"(https://[^\s]+)", line)
-        if m3 and "trycloudflare" in m3.group(1) or "cfargotunnel" in m3.group(1):
-            _tunnel_url = m3.group(1)
-            break
+    if provider == "cloudflare":
+        _ensure_cloudflared()
+        cf_bin = shutil.which("cloudflared") or str(Path(sys.executable).parent / "cloudflared.exe")
+        if cf_token:
+            cmd = [cf_bin, "tunnel", "--no-autoupdate", "run", "--token", cf_token]
+        else:
+            cmd = [cf_bin, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{port}"]
+        _tunnel_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True)
+        for line in _tunnel_proc.stdout:
+            _log(f"CF: {line.strip()}")
+            m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", line)
+            if m:
+                _tunnel_url = m.group(0)
+                break
+            m2 = re.search(r"https://\S+\.cfargotunnel\.com", line)
+            if m2:
+                _tunnel_url = m2.group(0)
+                break
+    elif provider == "ngrok":
+        ngrok_bin = shutil.which("ngrok")
+        if not ngrok_bin:
+            return "ngrok not found"
+        if ngrok_token:
+            subprocess.run([ngrok_bin, "config", "add-authtoken", ngrok_token],
+                           capture_output=True)
+        cmd = [ngrok_bin, "http", str(port), "--log", "stdout"]
+        if ngrok_domain:
+            cmd += ["--domain", ngrok_domain]
+        _tunnel_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True)
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                import urllib.request
+                with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels") as r:
+                    data = json.loads(r.read())
+                    tunnels = data.get("tunnels", [])
+                    if tunnels:
+                        _tunnel_url = tunnels[0]["public_url"]
+                        return _tunnel_url
+            except Exception:
+                pass
     return _tunnel_url
 
-def _start_ngrok_tunnel(port: int, token: str, domain: str) -> str:
-    global _tunnel_proc, _tunnel_url
-    _ensure_ngrok()
-    if token:
-        subprocess.run(["ngrok", "config", "add-authtoken", token],
-                       capture_output=True)
-    cmd = ["ngrok", "http", str(port), "--log", "stdout"]
-    if domain:
-        cmd += ["--domain", domain]
-    _tunnel_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1)
-    # Poll ngrok's local API for URL
-    for _ in range(30):
-        time.sleep(1)
-        try:
-            import urllib.request
-            with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels") as r:
-                data = json.loads(r.read())
-                tunnels = data.get("tunnels", [])
-                if tunnels:
-                    _tunnel_url = tunnels[0]["public_url"]
-                    return _tunnel_url
-        except Exception:
-            pass
-    return "Could not retrieve ngrok URL — check ngrok dashboard"
-
-
-# ── PORT SCAN ────────────────────────────────────────────────────────────────
-def _port_scan(host: str, ports_str: str, timeout_ms: int) -> dict:
-    timeout = timeout_ms / 1000
-    open_ports = []
-    if "-" in ports_str:
-        lo, hi = ports_str.split("-")
-        port_range = range(int(lo), int(hi) + 1)
-    else:
-        port_range = [int(p) for p in ports_str.split(",")]
-
-    def check(p):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        if s.connect_ex((host, p)) == 0:
-            open_ports.append(p)
-        s.close()
-
-    threads = [threading.Thread(target=check, args=(p,)) for p in port_range]
-    for t in threads: t.start()
-    for t in threads: t.join()
-    return {"host": host, "open_ports": sorted(open_ports)}
-
-
 # ════════════════════════════════════════════════════════════════════════════
-#  CALL HANDLER
+#  HTTP API  (Flask)
 # ════════════════════════════════════════════════════════════════════════════
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+api = Flask("vyro-mcp-api")
+CORS(api)
+
+def _ok(data: Any) -> Response:
+    global _request_count
+    _request_count += 1
+    return jsonify({"ok": True, "data": data})
+
+def _err(msg: str, code: int = 400) -> Response:
+    return jsonify({"ok": False, "error": msg}), code
+
+@api.before_request
+def _log_request():
+    _log(f"API {request.method} {request.path} from {request.remote_addr}")
+
+# ── Screen ────────────────────────────────────────────────────────────────────
+@api.route("/screen", methods=["GET"])
+def api_screen():
+    region = None
+    if request.args.get("x"):
+        region = {k: int(request.args[k]) for k in ("x","y","w","h")}
+    return _ok({"jpeg_b64": capture_screen_b64(region=region)})
+
+@api.route("/screen/stream")
+def api_screen_stream():
+    """MJPEG stream of screen — open in browser or img tag."""
+    def gen():
+        while True:
+            frame = capture_screen()
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            time.sleep(0.1)  # 10fps
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ── Camera ────────────────────────────────────────────────────────────────────
+@api.route("/camera/snap", methods=["GET"])
+def api_camera_snap():
+    device = int(request.args.get("device", 0))
     try:
-        return await _dispatch(name, arguments)
+        frame = camera_snap(device)
+        return _ok({"jpeg_b64": base64.b64encode(frame).decode()})
     except Exception as e:
-        return _err(f"{type(e).__name__}: {e}")
+        return _err(str(e))
 
+@api.route("/camera/stream")
+def api_camera_stream():
+    global _camera_running
+    if not _camera_running:
+        _camera_running = True
+        device = int(request.args.get("device", 0))
+        fps = int(request.args.get("fps", 15))
+        threading.Thread(target=_camera_loop, args=(device, fps), daemon=True).start()
+    def gen():
+        while True:
+            if _camera_frame:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + _camera_frame + b"\r\n")
+            time.sleep(0.067)  # ~15fps
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-async def _dispatch(name: str, args: dict) -> list[types.TextContent]:
-    global _tunnel_proc, _tunnel_url
-    # ── EYES ─────────────────────────────────────────────────────────────────
-    if name == "camera_snapshot":
-        frame = await asyncio.get_event_loop().run_in_executor(
-            None, _grab_frame,
-            args.get("device", 0), args.get("width", 1280), args.get("height", 720))
-        return _ok({"format": "jpeg", "base64": base64.b64encode(frame).decode()})
+@api.route("/camera/stop", methods=["POST"])
+def api_camera_stop():
+    global _camera_running
+    _camera_running = False
+    return _ok("stopped")
 
-    if name == "camera_stream_start":
-        if _camera_stream.get("running"):
-            return _ok("Stream already running")
-        _camera_stream.update({"running": True, "frame": None})
-        t = threading.Thread(target=_stream_loop,
-                             args=(args.get("device", 0), args.get("fps", 10)),
-                             daemon=True)
-        _camera_stream["thread"] = t
-        t.start()
-        return _ok("Camera stream started")
+# ── TTS / Audio ───────────────────────────────────────────────────────────────
+@api.route("/speak", methods=["POST"])
+def api_speak():
+    d = request.json or {}
+    speak(d.get("text",""), d.get("rate", 175), d.get("voice",""))
+    return _ok("speaking")
 
-    if name == "camera_get_frame":
-        frame = _camera_stream.get("frame")
-        if frame is None:
-            return _err("No frame yet — start stream first")
-        return _ok({"format": "jpeg", "base64": base64.b64encode(frame).decode()})
+@api.route("/audio/record", methods=["POST"])
+def api_audio_record():
+    d = request.json or {}
+    try:
+        wav = record_audio(float(d.get("seconds", 3)),
+                           int(d.get("rate", 44100)),
+                           int(d.get("channels", 1)))
+        return _ok({"wav_b64": base64.b64encode(wav).decode()})
+    except Exception as e:
+        return _err(str(e))
 
-    if name == "camera_stream_stop":
-        _camera_stream["running"] = False
-        return _ok("Camera stream stopped")
-
-    if name == "screen_capture":
-        # Try scrot, then import (ImageMagick), then xwd
-        tmp = tempfile.mktemp(suffix=".png")
-        for cmd in [["scrot", tmp], ["import", "-window", "root", tmp],
-                    ["gnome-screenshot", "-f", tmp]]:
-            if shutil.which(cmd[0]):
-                subprocess.run(cmd, check=True)
-                break
-        else:
-            return _err("No screenshot tool found (install scrot or imagemagick)")
-        data = Path(tmp).read_bytes()
-        os.unlink(tmp)
-        return _ok({"format": "png", "base64": base64.b64encode(data).decode()})
-
-    # ── EARS ──────────────────────────────────────────────────────────────────
-    if name == "audio_record":
-        wav = await asyncio.get_event_loop().run_in_executor(
-            None, _record_audio,
-            args["seconds"], args.get("sample_rate", 44100), args.get("channels", 1))
-        return _ok({"format": "wav", "base64": base64.b64encode(wav).decode()})
-
-    if name == "audio_stream_start":
-        return _ok("Audio streaming: use audio_record with short intervals")
-
-    if name == "audio_stream_stop":
-        return _ok("Audio stream stopped")
-
-    # ── MOUTH ─────────────────────────────────────────────────────────────────
-    if name == "speak":
-        await asyncio.get_event_loop().run_in_executor(
-            None, _speak, args["text"], args.get("rate", 175), args.get("voice", ""))
-        return _ok(f"Spoke: {args['text']!r}")
-
-    if name == "audio_play":
-        path = args["path"]
-        for player in ["mpv", "aplay", "paplay", "ffplay"]:
-            if shutil.which(player):
-                subprocess.Popen([player, path])
-                return _ok(f"Playing {path} with {player}")
-        return _err("No audio player found")
-
-    # ── FILESYSTEM ────────────────────────────────────────────────────────────
-    if name == "fs_read":
-        p = Path(args["path"])
-        offset = args.get("offset", 0)
-        length = args.get("length", -1)
-        if args.get("binary"):
-            data = p.read_bytes()
-            if offset: data = data[offset:]
-            if length > 0: data = data[:length]
-            return _ok({"base64": base64.b64encode(data).decode()})
-        text = p.read_text(errors="replace")
-        lines = text.splitlines()
-        if offset: lines = lines[offset:]
-        if length > 0: lines = lines[:length]
-        return _ok("\n".join(lines))
-
-    if name == "fs_write":
-        p = Path(args["path"])
-        p.parent.mkdir(parents=True, exist_ok=True)
-        content = args["content"]
-        if args.get("binary"):
-            content = base64.b64decode(content)
-            mode = "ab" if args.get("append") else "wb"
-            with open(p, mode) as f: f.write(content)
-        else:
-            mode = "a" if args.get("append") else "w"
-            with open(p, mode) as f: f.write(content)
-        return _ok(f"Written: {p}")
-
-    if name == "fs_list":
-        p = Path(args["path"])
-        if args.get("recursive"):
-            entries = [str(x) for x in p.rglob("*")]
-        else:
-            entries = [str(x) for x in p.iterdir()]
-        return _ok(entries)
-
-    if name == "fs_delete":
-        p = Path(args["path"])
-        if args.get("recursive") and p.is_dir():
-            shutil.rmtree(p)
-        else:
-            p.unlink() if p.is_file() else p.rmdir()
-        return _ok(f"Deleted: {p}")
-
-    if name == "fs_move":
-        shutil.move(args["src"], args["dst"])
-        return _ok(f"Moved: {args['src']} → {args['dst']}")
-
-    if name == "fs_copy":
-        src, dst = Path(args["src"]), Path(args["dst"])
-        if src.is_dir(): shutil.copytree(src, dst)
-        else: shutil.copy2(src, dst)
-        return _ok(f"Copied: {src} → {dst}")
-
-    # ── SHELL / PROCESS ───────────────────────────────────────────────────────
-    if name == "shell_exec":
-        env = {**os.environ, **args.get("env", {})}
-        result = subprocess.run(
-            args["cmd"], shell=True, capture_output=True, text=True,
-            cwd=args.get("cwd", "/"), timeout=args.get("timeout", 30), env=env)
-        return _ok({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-        })
-
-    if name == "process_list":
-        ps = _psutil()
-        procs = []
-        flt = args.get("filter", "").lower()
-        for p in ps.process_iter(["pid", "name", "status", "cpu_percent", "memory_percent"]):
-            info = p.info
-            if not flt or flt in info["name"].lower():
-                procs.append(info)
-        return _ok(procs)
-
-    if name == "process_kill":
-        ps = _psutil()
-        sig = args.get("sig", 15)
-        if "pid" in args:
-            os.kill(args["pid"], sig)
-            return _ok(f"Sent signal {sig} to PID {args['pid']}")
-        name_ = args.get("name", "")
-        killed = []
-        for p in ps.process_iter(["pid", "name"]):
-            if name_.lower() in p.info["name"].lower():
-                os.kill(p.pid, sig)
-                killed.append(p.pid)
-        return _ok({"killed_pids": killed})
-
-    if name == "process_spawn":
-        p = subprocess.Popen(args["cmd"], cwd=args.get("cwd", "/"),
-                             env={**os.environ, **args.get("env", {})},
-                             start_new_session=True)
-        return _ok({"pid": p.pid})
-
-    # ── HARDWARE / KERNEL ─────────────────────────────────────────────────────
-    if name == "hw_info":
-        ps = _psutil()
-        cpu = {
-            "physical_cores": ps.cpu_count(logical=False),
-            "logical_cores":  ps.cpu_count(logical=True),
-            "freq_mhz":       ps.cpu_freq()._asdict() if ps.cpu_freq() else {},
-            "usage_percent":  ps.cpu_percent(interval=0.5),
-        }
-        mem = ps.virtual_memory()._asdict()
-        swap = ps.swap_memory()._asdict()
-        disks = [d._asdict() for d in ps.disk_partitions()]
-        net = {k: v._asdict() for k, v in ps.net_if_addrs().items()}
-        # GPU via nvidia-smi if available
-        gpu = {}
-        if shutil.which("nvidia-smi"):
-            r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.used,temperature.gpu",
-                                 "--format=csv,noheader"], capture_output=True, text=True)
-            gpu = {"nvidia_smi": r.stdout.strip()}
-        return _ok({"cpu": cpu, "memory": mem, "swap": swap,
-                    "disks": disks, "network_interfaces": net, "gpu": gpu})
-
-    if name == "mem_read":
-        addr = args["address"]
-        length = args["length"]
-        with open("/dev/mem", "rb") as f:
-            f.seek(addr)
-            data = f.read(length)
-        return _ok({"address": hex(addr), "hex": data.hex(), "length": length})
-
-    if name == "mem_write":
-        addr = args["address"]
-        data = bytes.fromhex(args["data"])
-        with open("/dev/mem", "r+b") as f:
-            f.seek(addr)
-            f.write(data)
-        return _ok(f"Wrote {len(data)} bytes to {hex(addr)}")
-
-    if name == "kernel_module_load":
-        cmd = f"modprobe {args['module']} {args.get('params','')}"
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return _ok({"stdout": r.stdout, "stderr": r.stderr, "rc": r.returncode})
-
-    if name == "kernel_module_unload":
-        r = subprocess.run(["rmmod", args["module"]], capture_output=True, text=True)
-        return _ok({"stdout": r.stdout, "stderr": r.stderr, "rc": r.returncode})
-
-    if name == "kernel_sysctl":
-        key = args["key"]
-        value = args.get("value", "")
-        if value:
-            r = subprocess.run(["sysctl", "-w", f"{key}={value}"],
-                               capture_output=True, text=True)
-        else:
-            r = subprocess.run(["sysctl", key], capture_output=True, text=True)
-        return _ok({"stdout": r.stdout, "stderr": r.stderr})
-
-    if name == "gpio_write":
-        pin, val = args["pin"], args["value"]
-        gpio_path = Path(f"/sys/class/gpio/gpio{pin}")
-        if not gpio_path.exists():
-            Path("/sys/class/gpio/export").write_text(str(pin))
-            (gpio_path / "direction").write_text("out")
-        (gpio_path / "value").write_text(str(val))
-        return _ok(f"GPIO{pin} = {val}")
-
-    if name == "gpio_read":
-        pin = args["pin"]
-        gpio_path = Path(f"/sys/class/gpio/gpio{pin}")
-        if not gpio_path.exists():
-            Path("/sys/class/gpio/export").write_text(str(pin))
-            (gpio_path / "direction").write_text("in")
-        val = (gpio_path / "value").read_text().strip()
-        return _ok({"pin": pin, "value": int(val)})
-
-    if name == "usb_list":
-        r = subprocess.run(["lsusb"], capture_output=True, text=True)
-        return _ok(r.stdout)
-
-    if name == "i2c_scan":
-        bus = args.get("bus", 1)
-        r = subprocess.run(["i2cdetect", "-y", str(bus)], capture_output=True, text=True)
-        return _ok(r.stdout)
-
-    # ── NETWORK ───────────────────────────────────────────────────────────────
-    if name == "net_interfaces":
-        ps = _psutil()
-        addrs = {k: [a._asdict() for a in v]
-                 for k, v in ps.net_if_addrs().items()}
-        stats = {k: v._asdict() for k, v in ps.net_if_stats().items()}
-        return _ok({"addresses": addrs, "stats": stats})
-
-    if name == "net_scan":
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, _port_scan,
-            args["host"], args.get("ports", "1-1024"), args.get("timeout_ms", 300))
+# ── Shell ─────────────────────────────────────────────────────────────────────
+@api.route("/shell", methods=["POST"])
+def api_shell():
+    d = request.json or {}
+    cmd = d.get("cmd", "")
+    if not cmd:
+        return _err("cmd required")
+    try:
+        result = shell_exec(cmd, d.get("cwd"), int(d.get("timeout", 30)))
         return _ok(result)
+    except subprocess.TimeoutExpired:
+        return _err("timeout")
+    except Exception as e:
+        return _err(str(e))
 
-    if name == "net_packet_send":
-        data_str = args["data"]
-        try:
-            data = bytes.fromhex(data_str)
-        except ValueError:
-            data = data_str.encode()
-        proto = args.get("protocol", "udp").lower()
-        sock_type = socket.SOCK_DGRAM if proto == "udp" else socket.SOCK_STREAM
-        s = socket.socket(socket.AF_INET, sock_type)
-        if proto == "tcp":
-            s.connect((args["host"], args["port"]))
-        s.sendto(data, (args["host"], args["port"]))
-        s.close()
-        return _ok(f"Sent {len(data)} bytes via {proto.upper()} to {args['host']}:{args['port']}")
+# ── Filesystem ────────────────────────────────────────────────────────────────
+@api.route("/fs/read", methods=["POST"])
+def api_fs_read():
+    d = request.json or {}
+    path = d.get("path","")
+    try:
+        p = Path(path)
+        if d.get("binary"):
+            data = p.read_bytes()
+            return _ok({"b64": base64.b64encode(data).decode()})
+        return _ok({"text": p.read_text(errors="replace")})
+    except Exception as e:
+        return _err(str(e))
 
-    # ── TUNNEL ────────────────────────────────────────────────────────────────
-    if name == "tunnel_start":
-        port     = args["port"]
-        provider = args.get("provider", "cloudflare").lower()
-        if provider == "ngrok":
-            url = await asyncio.get_event_loop().run_in_executor(
-                None, _start_ngrok_tunnel,
-                port, args.get("ngrok_token", ""), args.get("ngrok_domain", ""))
+@api.route("/fs/write", methods=["POST"])
+def api_fs_write():
+    d = request.json or {}
+    try:
+        p = Path(d["path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        content = d["content"]
+        if d.get("binary"):
+            p.write_bytes(base64.b64decode(content))
         else:
-            url = await asyncio.get_event_loop().run_in_executor(
-                None, _start_cloudflare_tunnel,
-                port, args.get("cf_token", ""))
-        return _ok({"provider": provider, "url": url, "port": port})
+            mode = "a" if d.get("append") else "w"
+            with open(p, mode) as f:
+                f.write(content)
+        return _ok(str(p))
+    except Exception as e:
+        return _err(str(e))
 
-    if name == "tunnel_status":
-        if _tunnel_proc and _tunnel_proc.poll() is None:
-            return _ok({"running": True, "url": _tunnel_url})
-        return _ok({"running": False, "url": ""})
+@api.route("/fs/list", methods=["POST"])
+def api_fs_list():
+    d = request.json or {}
+    try:
+        p = Path(d["path"])
+        entries = []
+        for item in p.iterdir():
+            entries.append({
+                "name": item.name,
+                "type": "dir" if item.is_dir() else "file",
+                "size": item.stat().st_size if item.is_file() else 0,
+                "modified": datetime.fromtimestamp(item.stat().st_mtime).isoformat()
+            })
+        return _ok(entries)
+    except Exception as e:
+        return _err(str(e))
 
-    if name == "tunnel_stop":
+@api.route("/fs/delete", methods=["POST"])
+def api_fs_delete():
+    d = request.json or {}
+    try:
+        p = Path(d["path"])
+        if p.is_dir() and d.get("recursive"):
+            shutil.rmtree(p)
+        elif p.is_dir():
+            p.rmdir()
+        else:
+            p.unlink()
+        return _ok(f"deleted {p}")
+    except Exception as e:
+        return _err(str(e))
+
+# ── Windows UI Automation ─────────────────────────────────────────────────────
+@api.route("/ui/tree", methods=["POST"])
+def api_ui_tree():
+    d = request.json or {}
+    return _ok(get_ui_tree(d.get("window"), int(d.get("depth", 3))))
+
+@api.route("/ui/windows", methods=["GET"])
+def api_ui_windows():
+    return _ok(list_windows())
+
+@api.route("/ui/click", methods=["POST"])
+def api_ui_click():
+    d = request.json or {}
+    return _ok(click_ui_element(
+        d.get("automation_id"), d.get("name"),
+        d.get("x"), d.get("y")
+    ))
+
+@api.route("/ui/type", methods=["POST"])
+def api_ui_type():
+    d = request.json or {}
+    return _ok(type_text(d.get("text", "")))
+
+@api.route("/ui/key", methods=["POST"])
+def api_ui_key():
+    d = request.json or {}
+    return _ok(send_key(d.get("key", "")))
+
+@api.route("/ui/focus", methods=["POST"])
+def api_ui_focus():
+    d = request.json or {}
+    return _ok(focus_window(d.get("title", "")))
+
+# ── System info ───────────────────────────────────────────────────────────────
+@api.route("/sysinfo", methods=["GET"])
+def api_sysinfo():
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    return _ok({
+        "os": platform.platform(),
+        "hostname": socket.gethostname(),
+        "cpu_percent": psutil.cpu_percent(interval=0.3),
+        "cpu_cores": psutil.cpu_count(),
+        "memory": {"total_gb": round(mem.total/1e9,1),
+                   "used_gb":  round(mem.used/1e9,1),
+                   "percent":  mem.percent},
+        "disk":   {"total_gb": round(disk.total/1e9,1),
+                   "used_gb":  round(disk.used/1e9,1),
+                   "percent":  disk.percent},
+        "uptime": str(datetime.now() - datetime.fromtimestamp(psutil.boot_time())),
+    })
+
+@api.route("/processes", methods=["GET"])
+def api_processes():
+    flt = request.args.get("filter","").lower()
+    procs = []
+    for p in psutil.process_iter(["pid","name","status","cpu_percent","memory_percent"]):
+        if not flt or flt in p.info["name"].lower():
+            procs.append(p.info)
+    return _ok(procs)
+
+@api.route("/processes/kill", methods=["POST"])
+def api_kill():
+    d = request.json or {}
+    try:
+        pid = d.get("pid")
+        if pid:
+            os.kill(int(pid), 9)
+            return _ok(f"killed {pid}")
+        name = d.get("name","")
+        killed = []
+        for p in psutil.process_iter(["pid","name"]):
+            if name.lower() in p.info["name"].lower():
+                os.kill(p.pid, 9)
+                killed.append(p.pid)
+        return _ok(killed)
+    except Exception as e:
+        return _err(str(e))
+
+# ── Tunnel control ────────────────────────────────────────────────────────────
+@api.route("/tunnel/start", methods=["POST"])
+def api_tunnel_start():
+    d = request.json or {}
+    def _run():
+        url = start_tunnel(
+            d.get("port", _api_port),
+            d.get("provider", "cloudflare"),
+            d.get("cf_token",""),
+            d.get("ngrok_token",""),
+            d.get("ngrok_domain",""),
+        )
+        _log(f"Tunnel URL: {url}")
+    threading.Thread(target=_run, daemon=True).start()
+    return _ok("tunnel starting...")
+
+@api.route("/tunnel/status", methods=["GET"])
+def api_tunnel_status():
+    return _ok({"running": _tunnel_proc is not None and _tunnel_proc.poll() is None,
+                "url": _tunnel_url})
+
+@api.route("/tunnel/stop", methods=["POST"])
+def api_tunnel_stop():
+    global _tunnel_proc, _tunnel_url
+    if _tunnel_proc:
+        _tunnel_proc.terminate()
+        _tunnel_proc = None
+        _tunnel_url = ""
+    return _ok("stopped")
+
+# ── Clipboard ─────────────────────────────────────────────────────────────────
+@api.route("/clipboard", methods=["GET","POST"])
+def api_clipboard():
+    if request.method == "GET":
+        if IS_WINDOWS:
+            r = subprocess.run(["powershell", "-Command", "Get-Clipboard"],
+                               capture_output=True, text=True)
+            return _ok(r.stdout.strip())
+        return _err("Windows only")
+    d = request.json or {}
+    text = d.get("text","")
+    if IS_WINDOWS:
+        subprocess.run(["powershell", "-Command", f"Set-Clipboard '{text}'"],
+                       capture_output=True)
+    return _ok("set")
+
+# ── Status / health ───────────────────────────────────────────────────────────
+@api.route("/", methods=["GET"])
+def api_root():
+    return _ok({
+        "name": "vyro-mcp",
+        "version": "2.0.0",
+        "platform": platform.platform(),
+        "tunnel_url": _tunnel_url,
+        "requests_served": _request_count,
+        "endpoints": [
+            "GET  /screen", "GET  /screen/stream (MJPEG)",
+            "GET  /camera/snap", "GET  /camera/stream (MJPEG)",
+            "POST /speak", "POST /audio/record",
+            "POST /shell", "POST /fs/read", "POST /fs/write",
+            "POST /fs/list", "POST /fs/delete",
+            "POST /ui/tree", "GET  /ui/windows",
+            "POST /ui/click", "POST /ui/type", "POST /ui/key",
+            "POST /ui/focus",
+            "GET  /sysinfo", "GET  /processes",
+            "POST /processes/kill",
+            "POST /tunnel/start", "GET  /tunnel/status",
+            "GET/POST /clipboard",
+        ]
+    })
+
+# ════════════════════════════════════════════════════════════════════════════
+#  GUI DASHBOARD  (Tkinter)
+# ════════════════════════════════════════════════════════════════════════════
+class Dashboard:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("vyro-mcp  —  AI Control Server")
+        self.root.geometry("900x650")
+        self.root.configure(bg="#0d0d0d")
+        self.root.resizable(True, True)
+
+        # Fonts
+        f_title = tkfont.Font(family="Segoe UI", size=16, weight="bold")
+        f_mono  = tkfont.Font(family="Consolas", size=9)
+        f_label = tkfont.Font(family="Segoe UI", size=10)
+        f_big   = tkfont.Font(family="Segoe UI", size=22, weight="bold")
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(self.root, bg="#111", height=56)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="⚡ vyro-mcp", font=f_title,
+                 fg="#00e5ff", bg="#111").pack(side="left", padx=16, pady=12)
+        self.lbl_status = tk.Label(hdr, text="● STARTING",
+                                   font=f_label, fg="#ff9800", bg="#111")
+        self.lbl_status.pack(side="right", padx=16)
+
+        # ── Main area ─────────────────────────────────────────────────────────
+        main = tk.Frame(self.root, bg="#0d0d0d")
+        main.pack(fill="both", expand=True, padx=12, pady=8)
+
+        # Left column — controls
+        left = tk.Frame(main, bg="#0d0d0d", width=300)
+        left.pack(side="left", fill="y", padx=(0,8))
+        left.pack_propagate(False)
+
+        # API URL card
+        card1 = tk.LabelFrame(left, text=" Local API ", font=f_label,
+                               fg="#00e5ff", bg="#161616",
+                               relief="flat", bd=1,
+                               highlightbackground="#333", highlightthickness=1)
+        card1.pack(fill="x", pady=(0,8))
+        self.lbl_local = tk.Label(card1, text=f"http://localhost:{_api_port}",
+                                  font=f_mono, fg="#a0ffa0", bg="#161616",
+                                  cursor="hand2")
+        self.lbl_local.pack(padx=10, pady=8)
+        self.lbl_local.bind("<Button-1>", lambda e: self._copy(self.lbl_local.cget("text")))
+
+        # Tunnel card
+        card2 = tk.LabelFrame(left, text=" Tunnel URL ", font=f_label,
+                               fg="#00e5ff", bg="#161616",
+                               relief="flat", bd=1,
+                               highlightbackground="#333", highlightthickness=1)
+        card2.pack(fill="x", pady=(0,8))
+        self.lbl_tunnel = tk.Label(card2, text="Not started",
+                                   font=f_mono, fg="#888", bg="#161616",
+                                   wraplength=270, cursor="hand2")
+        self.lbl_tunnel.pack(padx=10, pady=6)
+        self.lbl_tunnel.bind("<Button-1>", lambda e: self._copy(self.lbl_tunnel.cget("text")))
+
+        # Tunnel controls
+        tframe = tk.Frame(left, bg="#0d0d0d")
+        tframe.pack(fill="x", pady=(0,8))
+        tk.Label(tframe, text="Provider:", font=f_label,
+                 fg="#aaa", bg="#0d0d0d").pack(side="left")
+        self.var_provider = tk.StringVar(value="cloudflare")
+        tk.OptionMenu(tframe, self.var_provider, "cloudflare", "ngrok").pack(side="left", padx=4)
+
+        tk.Label(left, text="Token (optional):", font=f_label,
+                 fg="#aaa", bg="#0d0d0d").pack(anchor="w")
+        self.ent_token = tk.Entry(left, font=f_mono, bg="#1a1a1a",
+                                  fg="#fff", insertbackground="#fff", show="•")
+        self.ent_token.pack(fill="x", pady=(0,8))
+
+        btn_frame = tk.Frame(left, bg="#0d0d0d")
+        btn_frame.pack(fill="x", pady=(0,12))
+        tk.Button(btn_frame, text="▶ Start Tunnel",
+                  font=f_label, bg="#005f73", fg="white",
+                  relief="flat", padx=8, pady=4,
+                  command=self._start_tunnel).pack(side="left", expand=True, fill="x", padx=(0,4))
+        tk.Button(btn_frame, text="■ Stop",
+                  font=f_label, bg="#400", fg="white",
+                  relief="flat", padx=8, pady=4,
+                  command=self._stop_tunnel).pack(side="left", expand=True, fill="x")
+
+        # Stats
+        stats = tk.Frame(left, bg="#161616")
+        stats.pack(fill="x", pady=(0,8))
+        self.lbl_reqs = tk.Label(stats, text="Requests: 0",
+                                 font=f_label, fg="#aaa", bg="#161616")
+        self.lbl_reqs.pack(anchor="w", padx=8, pady=4)
+        self.lbl_cpu = tk.Label(stats, text="CPU: —  RAM: —",
+                                font=f_label, fg="#aaa", bg="#161616")
+        self.lbl_cpu.pack(anchor="w", padx=8, pady=2)
+
+        # Screen preview toggle
+        tk.Button(left, text="📷 Preview Screen",
+                  font=f_label, bg="#1a1a2e", fg="#00e5ff",
+                  relief="flat", pady=4,
+                  command=self._toggle_preview).pack(fill="x", pady=(0,4))
+
+        tk.Button(left, text="🌐 Open API Docs",
+                  font=f_label, bg="#1a1a2e", fg="#00e5ff",
+                  relief="flat", pady=4,
+                  command=lambda: self._open_browser(f"http://localhost:{_api_port}/")).pack(fill="x")
+
+        # Right column — log + preview
+        right = tk.Frame(main, bg="#0d0d0d")
+        right.pack(side="left", fill="both", expand=True)
+
+        # Notebook tabs
+        nb = ttk.Notebook(right)
+        nb.pack(fill="both", expand=True)
+
+        # Log tab
+        log_frame = tk.Frame(nb, bg="#0d0d0d")
+        nb.add(log_frame, text=" Activity Log ")
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, font=f_mono, bg="#0a0a0a", fg="#b0ffb0",
+            insertbackground="#fff", relief="flat", state="disabled"
+        )
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Screen preview tab
+        preview_frame = tk.Frame(nb, bg="#000")
+        nb.add(preview_frame, text=" Screen Preview ")
+        self.canvas = tk.Canvas(preview_frame, bg="#000",
+                                highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._preview_active = False
+        self._preview_img = None
+
+        # Endpoints tab
+        ep_frame = tk.Frame(nb, bg="#0a0a0a")
+        nb.add(ep_frame, text=" Endpoints ")
+        ep_text = scrolledtext.ScrolledText(
+            ep_frame, font=f_mono, bg="#0a0a0a", fg="#88aaff",
+            relief="flat", state="normal"
+        )
+        ep_text.pack(fill="both", expand=True, padx=4, pady=4)
+        endpoints = """
+ SCREEN
+   GET  /screen              → JPEG screenshot (base64)
+   GET  /screen/stream       → MJPEG live stream (open in browser)
+   GET  /screen?x=0&y=0&w=800&h=600  → region capture
+
+ CAMERA
+   GET  /camera/snap         → webcam snapshot
+   GET  /camera/stream       → MJPEG webcam stream
+
+ VOICE
+   POST /speak               → {"text":"hello","rate":175}
+   POST /audio/record        → {"seconds":3}  → WAV base64
+
+ SHELL
+   POST /shell               → {"cmd":"dir","cwd":"C:\\\\","timeout":30}
+
+ FILESYSTEM
+   POST /fs/read             → {"path":"C:\\\\file.txt"}
+   POST /fs/write            → {"path":"...","content":"...","append":false}
+   POST /fs/list             → {"path":"C:\\\\Users"}
+   POST /fs/delete           → {"path":"...","recursive":false}
+
+ WINDOWS UI TREE
+   POST /ui/tree             → {"window":"Notepad","depth":3}
+   GET  /ui/windows          → list all open windows
+   POST /ui/click            → {"x":100,"y":200}
+   POST /ui/type             → {"text":"hello world"}
+   POST /ui/key              → {"key":"enter"}
+   POST /ui/focus            → {"title":"Chrome"}
+
+ SYSTEM
+   GET  /sysinfo             → CPU, RAM, disk, uptime
+   GET  /processes           → running processes
+   POST /processes/kill      → {"pid":1234} or {"name":"notepad"}
+
+ CLIPBOARD
+   GET  /clipboard           → read clipboard
+   POST /clipboard           → {"text":"copy this"}
+
+ TUNNEL
+   POST /tunnel/start        → {"provider":"cloudflare","cf_token":"..."}
+   GET  /tunnel/status       → current URL
+   POST /tunnel/stop
+"""
+        ep_text.insert("1.0", endpoints)
+        ep_text.configure(state="disabled")
+
+        # Style the notebook
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("TNotebook", background="#0d0d0d", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#1a1a1a",
+                        foreground="#aaa", padding=[10,4])
+        style.map("TNotebook.Tab",
+                  background=[("selected","#161616")],
+                  foreground=[("selected","#00e5ff")])
+
+        # Start update loop
+        self.root.after(1000, self._tick)
+
+    def _copy(self, text: str):
+        if text and text != "Not started":
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            _log(f"Copied: {text}")
+
+    def _start_tunnel(self):
+        provider = self.var_provider.get()
+        token = self.ent_token.get().strip()
+        port = _api_port
+        self.lbl_tunnel.config(text="Starting...", fg="#ff9800")
+        def _run():
+            url = start_tunnel(port, provider,
+                               token if provider == "cloudflare" else "",
+                               token if provider == "ngrok" else "")
+            self.lbl_tunnel.config(text=url or "Failed", fg="#a0ffa0" if url else "#f44")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _stop_tunnel(self):
+        global _tunnel_proc, _tunnel_url
         if _tunnel_proc:
             _tunnel_proc.terminate()
             _tunnel_proc = None
             _tunnel_url = ""
-        return _ok("Tunnel stopped")
+        self.lbl_tunnel.config(text="Stopped", fg="#888")
 
-    # ── SYSTEM ────────────────────────────────────────────────────────────────
-    if name == "sys_info":
-        ps = _psutil()
-        boot = datetime.fromtimestamp(ps.boot_time())
-        uptime = datetime.now() - boot
-        return _ok({
-            "os":        platform.platform(),
-            "hostname":  socket.gethostname(),
-            "boot_time": str(boot),
-            "uptime":    str(uptime),
-            "load_avg":  os.getloadavg(),
-            "memory":    ps.virtual_memory()._asdict(),
-            "disk":      ps.disk_usage("/")._asdict(),
-            "cpu_count": ps.cpu_count(),
-        })
+    def _toggle_preview(self):
+        self._preview_active = not self._preview_active
+        if self._preview_active:
+            self._update_preview()
 
-    if name == "sys_reboot":
-        delay = args.get("delay_seconds", 0)
-        subprocess.Popen(f"sleep {delay} && reboot", shell=True)
-        return _ok(f"Rebooting in {delay}s")
+    def _update_preview(self):
+        if not self._preview_active:
+            return
+        try:
+            img = ImageGrab.grab(all_screens=True)
+            w = self.canvas.winfo_width() or 400
+            h = self.canvas.winfo_height() or 300
+            img.thumbnail((w, h), Image.LANCZOS)
+            self._preview_img = ImageTk.PhotoImage(img)
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor="nw", image=self._preview_img)
+        except Exception:
+            pass
+        self.root.after(200, self._update_preview)  # 5fps preview
 
-    if name == "sys_shutdown":
-        delay = args.get("delay_seconds", 0)
-        subprocess.Popen(f"sleep {delay} && shutdown -h now", shell=True)
-        return _ok(f"Shutting down in {delay}s")
+    def _open_browser(self, url: str):
+        import webbrowser
+        webbrowser.open(url)
 
-    if name == "clipboard_get":
-        for cmd in [["xclip", "-selection", "clipboard", "-o"],
-                    ["xsel", "--clipboard", "--output"],
-                    ["pbpaste"]]:
-            if shutil.which(cmd[0]):
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                return _ok(r.stdout)
-        return _err("No clipboard tool found (install xclip or xsel)")
+    def _tick(self):
+        # Update log
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert("end", "\n".join(_app_log[-100:]))
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
-    if name == "clipboard_set":
-        text = args["text"]
-        for cmd, inp in [
-            (["xclip", "-selection", "clipboard"], text),
-            (["xsel", "--clipboard", "--input"], text),
-            (["pbcopy"], text),
-        ]:
-            if shutil.which(cmd[0]):
-                subprocess.run(cmd, input=inp, text=True)
-                return _ok("Clipboard set")
-        return _err("No clipboard tool found")
+        # Update stats
+        self.lbl_reqs.config(text=f"Requests: {_request_count}")
+        try:
+            cpu = psutil.cpu_percent()
+            mem = psutil.virtual_memory().percent
+            self.lbl_cpu.config(text=f"CPU: {cpu:.0f}%  RAM: {mem:.0f}%")
+        except Exception:
+            pass
 
-    return _err(f"Unknown tool: {name}")
+        # Update tunnel URL
+        if _tunnel_url and self.lbl_tunnel.cget("text") != _tunnel_url:
+            self.lbl_tunnel.config(text=_tunnel_url, fg="#a0ffa0")
+
+        # Update status
+        self.lbl_status.config(text="● RUNNING", fg="#00e5ff")
+
+        self.root.after(1000, self._tick)
+
+    def run(self):
+        self.root.mainloop()
 
 
 # ════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════
-async def main():
-    async with stdio_server() as (r, w):
-        await app.run(r, w, app.create_initialization_options())
+def _run_api():
+    _log(f"API server starting on port {_api_port}")
+    api.run(host="0.0.0.0", port=_api_port, debug=False,
+            use_reloader=False, threaded=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Auto-install Windows extras
+    if IS_WINDOWS:
+        for pkg in ["pygetwindow", "pyautogui"]:
+            try:
+                __import__(pkg.replace("-","_"))
+            except ImportError:
+                _pip(pkg)
+
+    _log("vyro-mcp starting...")
+    _log(f"Platform: {platform.platform()}")
+    _log(f"Python: {sys.version.split()[0]}")
+
+    # Start Flask in background thread
+    api_thread = threading.Thread(target=_run_api, daemon=True)
+    api_thread.start()
+    time.sleep(0.5)
+    _log(f"API ready → http://localhost:{_api_port}")
+
+    # Start GUI (main thread)
+    dash = Dashboard()
+    dash.run()
