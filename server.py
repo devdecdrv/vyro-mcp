@@ -742,6 +742,256 @@ def api_clipboard():
                        capture_output=True)
     return _ok("set")
 
+# ════════════════════════════════════════════════════════════════════════════
+#  MCP-over-SSE  (Claude Desktop / MCP clients connect here)
+#  Endpoint: GET  /mcp   → SSE stream (server→client)
+#            POST /mcp   → JSON-RPC messages (client→server)
+# ════════════════════════════════════════════════════════════════════════════
+
+_mcp_clients: dict[str, "queue.Queue"] = {}
+import queue as _queue_mod
+import uuid as _uuid_mod
+
+_MCP_TOOLS = [
+    {"name":"screen_capture","description":"Take a screenshot of the Windows desktop. Returns JPEG as base64.",
+     "inputSchema":{"type":"object","properties":{"region":{"type":"object","description":"Optional {x,y,w,h} crop region","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}},"required":[]}},
+    {"name":"shell_exec","description":"Run a shell command on the Windows PC. Returns stdout, stderr, exit code.",
+     "inputSchema":{"type":"object","properties":{"cmd":{"type":"string","description":"Command to run"},"cwd":{"type":"string","description":"Working directory"},"timeout":{"type":"integer","description":"Timeout seconds","default":30}},"required":["cmd"]}},
+    {"name":"fs_read","description":"Read a file from the PC filesystem.",
+     "inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path"},"binary":{"type":"boolean","description":"Return base64 binary instead of text"}},"required":["path"]}},
+    {"name":"fs_write","description":"Write or append to a file on the PC.",
+     "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"append":{"type":"boolean","default":False},"binary":{"type":"boolean","default":False}},"required":["path","content"]}},
+    {"name":"fs_list","description":"List files and folders in a directory.",
+     "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+    {"name":"fs_delete","description":"Delete a file or folder.",
+     "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean","default":False}},"required":["path"]}},
+    {"name":"speak","description":"Make the PC speak text using text-to-speech.",
+     "inputSchema":{"type":"object","properties":{"text":{"type":"string"},"rate":{"type":"integer","default":175},"voice":{"type":"string","default":""}},"required":["text"]}},
+    {"name":"ui_tree","description":"Get the Windows UI Automation tree for an app — lists all buttons, fields, menus.",
+     "inputSchema":{"type":"object","properties":{"window":{"type":"string","description":"Window title (partial match ok)"},"depth":{"type":"integer","default":3,"description":"Tree depth"}},"required":[]}},
+    {"name":"ui_windows","description":"List all open windows on the PC with their titles and process IDs.",
+     "inputSchema":{"type":"object","properties":{},"required":[]}},
+    {"name":"ui_click","description":"Click at screen coordinates.",
+     "inputSchema":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"]}},
+    {"name":"ui_type","description":"Type text into the focused window.",
+     "inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+    {"name":"ui_key","description":"Press a keyboard key (enter, tab, escape, f5, etc).",
+     "inputSchema":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}},
+    {"name":"ui_focus","description":"Bring a window to the foreground by title.",
+     "inputSchema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"]}},
+    {"name":"sysinfo","description":"Get CPU, RAM, disk usage, hostname, OS version and uptime.",
+     "inputSchema":{"type":"object","properties":{},"required":[]}},
+    {"name":"processes","description":"List running processes. Optional name filter.",
+     "inputSchema":{"type":"object","properties":{"filter":{"type":"string","description":"Filter by name"}},"required":[]}},
+    {"name":"process_kill","description":"Kill a process by PID or name.",
+     "inputSchema":{"type":"object","properties":{"pid":{"type":"integer"},"name":{"type":"string"}},"required":[]}},
+    {"name":"clipboard_get","description":"Read the Windows clipboard text.",
+     "inputSchema":{"type":"object","properties":{},"required":[]}},
+    {"name":"clipboard_set","description":"Write text to the Windows clipboard.",
+     "inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+    {"name":"camera_snap","description":"Take a webcam photo. Returns JPEG as base64.",
+     "inputSchema":{"type":"object","properties":{"device":{"type":"integer","default":0}},"required":[]}},
+    {"name":"tunnel_start","description":"Start a Cloudflare or ngrok tunnel for remote access.",
+     "inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["cloudflare","ngrok"],"default":"cloudflare"},"cf_token":{"type":"string","default":""},"ngrok_token":{"type":"string","default":""},"ngrok_domain":{"type":"string","default":""}},"required":[]}},
+    {"name":"tunnel_status","description":"Get the current tunnel URL and running status.",
+     "inputSchema":{"type":"object","properties":{},"required":[]}},
+]
+
+def _mcp_call_tool(name: str, args: dict) -> str:
+    """Execute a tool call and return result as text."""
+    try:
+        if name == "screen_capture":
+            b64 = capture_screen_b64(region=args.get("region"))
+            return f"Screenshot captured. JPEG base64 ({len(b64)} chars):\n{b64[:200]}..."
+        elif name == "shell_exec":
+            r = shell_exec(args["cmd"], args.get("cwd"), int(args.get("timeout", 30)))
+            return json.dumps(r, indent=2)
+        elif name == "fs_read":
+            p = Path(args["path"])
+            if args.get("binary"):
+                return base64.b64encode(p.read_bytes()).decode()
+            return p.read_text(errors="replace")
+        elif name == "fs_write":
+            p = Path(args["path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if args.get("append") else "w"
+            if args.get("binary"):
+                p.write_bytes(base64.b64decode(args["content"]))
+            else:
+                with open(p, mode) as f:
+                    f.write(args["content"])
+            return f"Written: {p}"
+        elif name == "fs_list":
+            p = Path(args["path"])
+            entries = [{"name": i.name, "type": "dir" if i.is_dir() else "file",
+                        "size": i.stat().st_size if i.is_file() else 0}
+                       for i in p.iterdir()]
+            return json.dumps(entries, indent=2)
+        elif name == "fs_delete":
+            p = Path(args["path"])
+            if p.is_dir() and args.get("recursive"):
+                shutil.rmtree(p)
+            elif p.is_dir():
+                p.rmdir()
+            else:
+                p.unlink()
+            return f"Deleted: {p}"
+        elif name == "speak":
+            speak(args["text"], int(args.get("rate", 175)), args.get("voice", ""))
+            return "Speaking..."
+        elif name == "ui_tree":
+            return json.dumps(get_ui_tree(args.get("window"), int(args.get("depth", 3))), indent=2)
+        elif name == "ui_windows":
+            return json.dumps(list_windows(), indent=2)
+        elif name == "ui_click":
+            return json.dumps(click_ui_element(x=args.get("x"), y=args.get("y")))
+        elif name == "ui_type":
+            return json.dumps(type_text(args.get("text", "")))
+        elif name == "ui_key":
+            return json.dumps(send_key(args.get("key", "")))
+        elif name == "ui_focus":
+            return json.dumps(focus_window(args.get("title", "")))
+        elif name == "sysinfo":
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage("/")
+            return json.dumps({
+                "os": platform.platform(), "hostname": socket.gethostname(),
+                "cpu_percent": psutil.cpu_percent(interval=0.3), "cpu_cores": psutil.cpu_count(),
+                "memory": {"total_gb": round(mem.total/1e9,1), "used_gb": round(mem.used/1e9,1), "percent": mem.percent},
+                "disk": {"total_gb": round(disk.total/1e9,1), "used_gb": round(disk.used/1e9,1), "percent": disk.percent},
+            }, indent=2)
+        elif name == "processes":
+            flt = args.get("filter", "").lower()
+            procs = [p.info for p in psutil.process_iter(["pid","name","status","cpu_percent","memory_percent"])
+                     if not flt or flt in (p.info.get("name") or "").lower()]
+            return json.dumps(procs[:100], indent=2)
+        elif name == "process_kill":
+            if args.get("pid"):
+                os.kill(int(args["pid"]), 9)
+                return f"Killed PID {args['pid']}"
+            killed = []
+            for proc in psutil.process_iter(["pid","name"]):
+                if args.get("name","").lower() in (proc.info.get("name") or "").lower():
+                    os.kill(proc.pid, 9); killed.append(proc.pid)
+            return f"Killed: {killed}"
+        elif name == "clipboard_get":
+            if IS_WINDOWS:
+                r = subprocess.run(["powershell","-Command","Get-Clipboard"], capture_output=True, text=True)
+                return r.stdout.strip()
+            return "Windows only"
+        elif name == "clipboard_set":
+            if IS_WINDOWS:
+                subprocess.run(["powershell","-Command",f"Set-Clipboard '{args.get('text','')}'"], capture_output=True)
+            return "Set"
+        elif name == "camera_snap":
+            frame = camera_snap(int(args.get("device", 0)))
+            b64 = base64.b64encode(frame).decode()
+            return f"Webcam photo. JPEG base64 ({len(b64)} chars):\n{b64[:200]}..."
+        elif name == "tunnel_start":
+            def _run():
+                start_tunnel(_api_port, args.get("provider","cloudflare"),
+                             args.get("cf_token",""), args.get("ngrok_token",""), args.get("ngrok_domain",""))
+            threading.Thread(target=_run, daemon=True).start()
+            return "Tunnel starting..."
+        elif name == "tunnel_status":
+            running = _tunnel_proc is not None and _tunnel_proc.poll() is None
+            return json.dumps({"running": running, "url": _tunnel_url})
+        else:
+            return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Error: {e}"
+
+def _mcp_handle(msg: dict) -> dict | None:
+    """Handle a JSON-RPC message, return response dict or None for notifications."""
+    method = msg.get("method", "")
+    mid    = msg.get("id")
+    params = msg.get("params", {})
+
+    def ok(result):
+        return {"jsonrpc":"2.0","id":mid,"result":result}
+    def err(code, text):
+        return {"jsonrpc":"2.0","id":mid,"error":{"code":code,"message":text}}
+
+    if method == "initialize":
+        return ok({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "vyro-mcp", "version": "2.0.0"}
+        })
+    elif method == "initialized":
+        return None  # notification, no response
+    elif method == "tools/list":
+        return ok({"tools": _MCP_TOOLS})
+    elif method == "tools/call":
+        name = params.get("name","")
+        args = params.get("arguments", {})
+        _log(f"MCP tool call: {name}")
+        result_text = _mcp_call_tool(name, args)
+        # Return image for screen/camera
+        if name in ("screen_capture", "camera_snap") and result_text:
+            # extract the full b64 — crude but works
+            lines = result_text.split("\n")
+            b64_part = lines[-1] if len(lines) > 1 else ""
+            # get full b64 from actual capture
+            try:
+                if name == "screen_capture":
+                    full_b64 = capture_screen_b64(region=args.get("region"))
+                else:
+                    full_b64 = base64.b64encode(camera_snap(int(args.get("device",0)))).decode()
+                return ok({"content":[{"type":"image","data":full_b64,"mimeType":"image/jpeg"}]})
+            except Exception:
+                pass
+        return ok({"content":[{"type":"text","text":result_text}]})
+    elif method == "ping":
+        return ok({})
+    else:
+        if mid is not None:
+            return err(-32601, f"Method not found: {method}")
+        return None
+
+@api.route("/mcp", methods=["GET"])
+def mcp_sse():
+    """SSE endpoint — MCP clients open this to receive server events."""
+    client_id = _uuid_mod.uuid4().hex
+    q = _queue_mod.Queue()
+    _mcp_clients[client_id] = q
+
+    def stream():
+        # Send endpoint event so client knows where to POST
+        post_url = f"{request.url_root.rstrip('/')}mcp"
+        yield f"event: endpoint\ndata: {post_url}\n\n"
+        try:
+            while True:
+                try:
+                    msg = q.get(timeout=15)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                except _queue_mod.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            _mcp_clients.pop(client_id, None)
+
+    return Response(stream(),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no",
+                             "Access-Control-Allow-Origin":"*"})
+
+@api.route("/mcp", methods=["POST"])
+def mcp_post():
+    """JSON-RPC messages from MCP client."""
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        return jsonify({"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"Parse error"}}), 400
+
+    # Handle batch
+    if isinstance(body, list):
+        responses = [r for r in (_mcp_handle(m) for m in body) if r is not None]
+        return jsonify(responses) if responses else ("", 204)
+
+    resp = _mcp_handle(body)
+    if resp is None:
+        return "", 204
+    return jsonify(resp)
+
 # ── Status / health ───────────────────────────────────────────────────────────
 @api.route("/", methods=["GET"])
 def api_root():
