@@ -45,10 +45,14 @@ jobs:
           name: vyro-mcp-windows
           path: dist/vyro-mcp.exe
 
-      - name: Upload EXE to Release
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+      - name: Create or update release and upload EXE
         run: |
-          gh release upload v1.0.0 dist/vyro-mcp.exe --clobber
+          $tag = "v1.0.0"
+          $exists = gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "vyro-mcp v1.0.0" --notes "Full root/kernel/hardware MCP server. Gives any AI eyes, ears, mouth and hands over HTTPS."
+          }
+          gh release upload $tag dist\vyro-mcp.exe --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -88,9 +92,12 @@ jobs:
           name: vyro-mcp-linux
           path: dist/vyro-mcp
 
-      - name: Upload Linux binary to Release
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+      - name: Create or update release and upload Linux binary
         run: |
-          gh release upload v1.0.0 dist/vyro-mcp --clobber
+          tag="v1.0.0"
+          gh release view "$tag" 2>/dev/null || \
+            gh release create "$tag" --title "vyro-mcp v1.0.0" \
+              --notes "Full root/kernel/hardware MCP server."
+          gh release upload "$tag" dist/vyro-mcp --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
