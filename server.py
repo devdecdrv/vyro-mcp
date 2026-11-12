@@ -636,6 +636,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 
 async def _dispatch(name: str, args: dict) -> list[types.TextContent]:
+    global _tunnel_proc, _tunnel_url
     # ── EYES ─────────────────────────────────────────────────────────────────
     if name == "camera_snapshot":
         frame = await asyncio.get_event_loop().run_in_executor(
@@ -917,7 +918,6 @@ async def _dispatch(name: str, args: dict) -> list[types.TextContent]:
 
     # ── TUNNEL ────────────────────────────────────────────────────────────────
     if name == "tunnel_start":
-        global _tunnel_url
         port     = args["port"]
         provider = args.get("provider", "cloudflare").lower()
         if provider == "ngrok":
@@ -936,7 +936,6 @@ async def _dispatch(name: str, args: dict) -> list[types.TextContent]:
         return _ok({"running": False, "url": ""})
 
     if name == "tunnel_stop":
-        global _tunnel_proc, _tunnel_url
         if _tunnel_proc:
             _tunnel_proc.terminate()
             _tunnel_proc = None
