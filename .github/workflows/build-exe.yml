@@ -21,18 +21,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PortAudio for pyaudio
-        run: |
-          pip install pipwin
-          pipwin install pyaudio
-
       - name: Install dependencies
         run: |
           pip install pyinstaller mcp psutil opencv-python pyttsx3 flask flask-cors pillow pygetwindow pyautogui comtypes
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --windowed --name vyro-mcp --hidden-import mcp --hidden-import mcp.server --hidden-import mcp.server.stdio --hidden-import psutil --hidden-import cv2 --hidden-import pyaudio --hidden-import pyttsx3 --hidden-import pyttsx3.drivers --hidden-import pyttsx3.drivers.sapi5 --hidden-import flask --hidden-import flask_cors --hidden-import PIL --hidden-import PIL.ImageGrab --hidden-import comtypes --hidden-import comtypes.client --hidden-import pygetwindow --hidden-import pyautogui --collect-all pyttsx3 --collect-all comtypes server.py
+          pyinstaller --onefile --windowed --name vyro-mcp `
+            --hidden-import mcp `
+            --hidden-import mcp.server `
+            --hidden-import mcp.server.stdio `
+            --hidden-import psutil `
+            --hidden-import cv2 `
+            --hidden-import pyttsx3 `
+            --hidden-import pyttsx3.drivers `
+            --hidden-import pyttsx3.drivers.sapi5 `
+            --hidden-import flask `
+            --hidden-import flask_cors `
+            --hidden-import PIL `
+            --hidden-import PIL.ImageGrab `
+            --hidden-import comtypes `
+            --hidden-import comtypes.client `
+            --hidden-import pygetwindow `
+            --hidden-import pyautogui `
+            --collect-all pyttsx3 `
+            --collect-all comtypes `
+            server.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
