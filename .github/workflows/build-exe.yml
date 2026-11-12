@@ -1,0 +1,95 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller mcp psutil opencv-python pyaudio pyttsx3
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --name vyro-mcp --icon NONE `
+            --hidden-import mcp `
+            --hidden-import mcp.server `
+            --hidden-import mcp.server.stdio `
+            --hidden-import psutil `
+            --hidden-import cv2 `
+            --hidden-import pyaudio `
+            --hidden-import pyttsx3 `
+            --hidden-import pyttsx3.drivers `
+            --hidden-import pyttsx3.drivers.sapi5 `
+            server.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyro-mcp-windows
+          path: dist/vyro-mcp.exe
+
+      - name: Upload to Release (if release event)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vyro-mcp.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get install -y portaudio19-dev espeak
+
+      - name: Install Python deps
+        run: |
+          pip install pyinstaller mcp psutil opencv-python-headless pyaudio pyttsx3
+
+      - name: Build Linux binary
+        run: |
+          pyinstaller --onefile --name vyro-mcp \
+            --hidden-import mcp \
+            --hidden-import mcp.server \
+            --hidden-import mcp.server.stdio \
+            --hidden-import psutil \
+            --hidden-import cv2 \
+            --hidden-import pyaudio \
+            --hidden-import pyttsx3 \
+            server.py
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyro-mcp-linux
+          path: dist/vyro-mcp
+
+      - name: Upload to Release (if release event)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vyro-mcp
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
