@@ -936,7 +936,7 @@ async def _dispatch(name: str, args: dict) -> list[types.TextContent]:
         return _ok({"running": False, "url": ""})
 
     if name == "tunnel_stop":
-        global _tunnel_proc
+        global _tunnel_proc, _tunnel_url
         if _tunnel_proc:
             _tunnel_proc.terminate()
             _tunnel_proc = None
