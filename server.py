@@ -43,7 +43,6 @@ def _ensure_deps():
         "cv2": "opencv-python",
         "psutil": "psutil",
         "pyttsx3": "pyttsx3",
-        "pyaudio": "pyaudio",
     }
     for mod, pkg in checks.items():
         try:
@@ -75,10 +74,11 @@ except ImportError:
     HAS_CV2 = False
 
 try:
-    import pyaudio
+    import pyaudio  # type: ignore
     HAS_AUDIO = True
-except ImportError:
+except Exception:
     HAS_AUDIO = False
+    pyaudio = None
 
 # Windows-only
 IS_WINDOWS = sys.platform == "win32"
