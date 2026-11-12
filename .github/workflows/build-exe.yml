@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, master]
   release:
-    types: [created]
+    types: [published, created]
   workflow_dispatch:
 
 jobs:
@@ -42,10 +42,11 @@ jobs:
           name: vyro-mcp-windows
           path: dist/vyro-mcp.exe
 
-      - name: Upload to Release (if release event)
-        if: github.event_name == 'release'
+      - name: Upload to Release
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v1.0.0
           files: dist/vyro-mcp.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,16 +81,17 @@ jobs:
             --hidden-import pyttsx3 \
             server.py
 
-      - name: Upload Linux binary
+      - name: Upload Linux binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: vyro-mcp-linux
           path: dist/vyro-mcp
 
-      - name: Upload to Release (if release event)
-        if: github.event_name == 'release'
+      - name: Upload to Release
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v1.0.0
           files: dist/vyro-mcp
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
