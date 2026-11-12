@@ -3,8 +3,6 @@ name: Build Windows EXE
 on:
   push:
     branches: [main, master]
-  release:
-    types: [published, created]
   workflow_dispatch:
 
 permissions:
@@ -23,14 +21,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pyinstaller mcp psutil opencv-python pyttsx3 flask flask-cors pillow pygetwindow pyautogui comtypes
+          pip install pyinstaller mcp psutil opencv-python pyttsx3 `
+            flask flask-cors pillow pygetwindow pyautogui comtypes `
+            pywinauto
 
       - name: Build EXE
         run: |
           pyinstaller --onefile --windowed --name vyro-mcp `
-            --hidden-import mcp `
-            --hidden-import mcp.server `
-            --hidden-import mcp.server.stdio `
             --hidden-import psutil `
             --hidden-import cv2 `
             --hidden-import pyttsx3 `
@@ -44,8 +41,13 @@ jobs:
             --hidden-import comtypes.client `
             --hidden-import pygetwindow `
             --hidden-import pyautogui `
+            --hidden-import pywinauto `
+            --hidden-import pywinauto.application `
+            --hidden-import pywinauto.desktop `
+            --hidden-import pywinauto.findwindows `
             --collect-all pyttsx3 `
             --collect-all comtypes `
+            --collect-all pywinauto `
             server.py
 
       - name: Upload EXE artifact
@@ -56,10 +58,33 @@ jobs:
 
       - name: Create release and upload EXE
         run: |
-          $tag = "v2.0.0"
+          $tag = "v3.0.0"
           $exists = gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "vyro-mcp v2.0.0" --notes "Windows AI Control Server with GUI dashboard, screen stream, UI automation, HTTP API."
+            gh release create $tag `
+              --title "vyro-mcp v3.0.0 — Advanced Windows AI Control Server" `
+              --notes "## vyro-mcp v3.0.0
+
+Full Windows AI Control Server — 31 tools.
+
+### What's new in v3
+- **Mouse drag, scroll, right-click, double-click** — select text, move sliders, drag files
+- **Keyboard combos** — Ctrl+C, Alt+Tab, Win+D, Ctrl+Shift+Esc in one call
+- **Working UI Automation** via pywinauto — click by name, not pixel guessing
+- **Batch executor** — full action sequences in one API call, faster
+- **PC Memory** — AI writes layout discoveries, reads them next session
+- **Window management** — move, resize, minimize, maximize, close
+- **Clipboard image** — read/write images in clipboard
+- **Chrome DevTools** — run JS, DOM access, screenshot covered windows
+- **Event hooks** — download complete, process crash notifications
+- **No terminal windows** — everything runs silently in background
+- **Background screen loop** — always-fresh frame, instant capture
+
+### Setup
+1. Download vyro-mcp.exe
+2. Run as Administrator
+3. GUI opens — click Start Tunnel for a public HTTPS URL
+4. In Claude Desktop add MCP server: paste the tunnel URL + /mcp"
           }
           gh release upload $tag dist\vyro-mcp.exe --clobber
         env:
