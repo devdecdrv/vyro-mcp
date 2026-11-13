@@ -65,7 +65,7 @@ jobs:
               --title "vyro-mcp v3.0.0 — Advanced Windows AI Control Server" `
               --notes "## vyro-mcp v3.0.0
 
-Full Windows AI Control Server — 31 tools.
+Full Windows AI Control Server — 33 tools.
 
 ### What's new in v3
 - **Mouse drag, scroll, right-click, double-click** — select text, move sliders, drag files
@@ -79,6 +79,7 @@ Full Windows AI Control Server — 31 tools.
 - **Event hooks** — download complete, process crash notifications
 - **No terminal windows** — everything runs silently in background
 - **Background screen loop** — always-fresh frame, instant capture
+- **Continuous passive vision** — call vision_subscribe once, screen frames push automatically as MCP notifications forever — AI has always-on eyes, no polling needed
 
 ### Setup
 1. Download vyro-mcp.exe
