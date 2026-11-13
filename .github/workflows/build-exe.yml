@@ -62,30 +62,8 @@ jobs:
           $exists = gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag `
-              --title "vyro-mcp v3.0.0 — Advanced Windows AI Control Server" `
-              --notes "## vyro-mcp v3.0.0
-
-Full Windows AI Control Server — 33 tools.
-
-### What's new in v3
-- **Mouse drag, scroll, right-click, double-click** — select text, move sliders, drag files
-- **Keyboard combos** — Ctrl+C, Alt+Tab, Win+D, Ctrl+Shift+Esc in one call
-- **Working UI Automation** via pywinauto — click by name, not pixel guessing
-- **Batch executor** — full action sequences in one API call, faster
-- **PC Memory** — AI writes layout discoveries, reads them next session
-- **Window management** — move, resize, minimize, maximize, close
-- **Clipboard image** — read/write images in clipboard
-- **Chrome DevTools** — run JS, DOM access, screenshot covered windows
-- **Event hooks** — download complete, process crash notifications
-- **No terminal windows** — everything runs silently in background
-- **Background screen loop** — always-fresh frame, instant capture
-- **Continuous passive vision** — call vision_subscribe once, screen frames push automatically as MCP notifications forever — AI has always-on eyes, no polling needed
-
-### Setup
-1. Download vyro-mcp.exe
-2. Run as Administrator
-3. GUI opens — click Start Tunnel for a public HTTPS URL
-4. In Claude Desktop add MCP server: paste the tunnel URL + /mcp"
+              --title "vyro-mcp v3.0.0 - Advanced Windows AI Control Server" `
+              --notes-file .github/workflows/release-notes.md
           }
           gh release upload $tag dist\vyro-mcp.exe --clobber
         env:
