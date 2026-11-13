@@ -25,6 +25,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Force UTF-8 stdout so emoji/unicode in logs don't crash on Windows cp1252
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ── Auto-install ──────────────────────────────────────────────────────────────
 _NO_WIN = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
 
@@ -114,6 +121,15 @@ _screen_running = False
 _screen_hash: str = ""
 _screen_change_callbacks: list = []
 
+# Vision subscribers — SSE clients waiting for frames
+_vision_subscribers: dict[str, queue.Queue] = {}  # client_id -> queue of jpeg bytes
+_VISION_FPS = 2          # frames per second pushed to subscribers
+_VISION_CHANGE_ONLY = True  # only push when screen actually changed
+
+# MCP passive vision — per-MCP-client vision push threads
+# key: mcp_client_id, value: {"stop": threading.Event, "vsub_id": str}
+_mcp_vision_sessions: dict[str, dict] = {}
+
 # Event hook state
 _event_queue: list[dict] = []
 _watched_processes: dict[str, int] = {}  # name -> pid
@@ -127,7 +143,9 @@ def _log(msg: str):
     _app_log.append(line)
     if len(_app_log) > 500:
         _app_log.pop(0)
-    print(line)
+    # Strip non-ASCII so Windows cp1252 stdout never crashes
+    safe = line.encode("ascii", errors="replace").decode("ascii")
+    print(safe)
 
 def _push_event(kind: str, data: dict):
     _event_queue.append({"time": datetime.now().isoformat(), "kind": kind, **data})
@@ -155,21 +173,38 @@ def capture_screen_b64(**kw) -> str:
     return base64.b64encode(capture_screen(**kw)).decode()
 
 def _screen_loop():
-    """Background: captures every 500ms, detects meaningful changes."""
+    """Background: captures continuously, detects changes, feeds vision subscribers."""
     global _screen_frame, _screen_running, _screen_hash
+    interval = 1.0 / max(_VISION_FPS, 2)
     while _screen_running:
         try:
             frame = capture_screen(quality=75)
-            # Hash a downsampled version for change detection
             thumb = Image.open(io.BytesIO(frame)).resize((160, 90))
             new_hash = hashlib.md5(thumb.tobytes()).hexdigest()
+            changed = new_hash != _screen_hash
             _screen_frame = frame
-            if new_hash != _screen_hash:
+            if changed:
                 _screen_hash = new_hash
                 _push_event("screen_change", {"hash": new_hash[:8]})
+                # Push to all vision subscribers
+                dead = []
+                for cid, q in _vision_subscribers.items():
+                    try:
+                        q.put_nowait(frame)
+                    except queue.Full:
+                        dead.append(cid)
+                for cid in dead:
+                    _vision_subscribers.pop(cid, None)
+            elif not _VISION_CHANGE_ONLY:
+                # Push every frame regardless
+                for cid, q in list(_vision_subscribers.items()):
+                    try:
+                        q.put_nowait(frame)
+                    except queue.Full:
+                        pass
         except Exception:
             pass
-        time.sleep(0.5)
+        time.sleep(interval)
 
 def _start_screen_loop():
     global _screen_running
@@ -656,8 +691,8 @@ def batch_execute(actions: list[dict]) -> list[dict]:
                 result = keyboard_key(action["key"])
             elif t == "combo":
                 result = keyboard_combo(action["keys"])
-            elif t == "screenshot":
-                frame = capture_screen()
+            elif t in ("screenshot", "vision_latest"):
+                frame = _screen_frame or capture_screen()
                 result = {"jpeg_b64": base64.b64encode(frame).decode()}
             elif t == "shell":
                 result = shell_exec(action["cmd"],
@@ -997,12 +1032,51 @@ def api_screen_latest():
 
 @api.route("/screen/stream")
 def api_screen_stream():
+    """MJPEG stream — open in browser."""
     def gen():
         while True:
             frame = _screen_frame or capture_screen()
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             time.sleep(0.1)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@api.route("/vision/stream")
+def api_vision_stream():
+    """SSE stream of screen frames — only sent when screen changes.
+    Each event is: data: <jpeg_base64>
+    AI can subscribe here for continuous passive vision without polling."""
+    client_id = uuid.uuid4().hex
+    q: queue.Queue = queue.Queue(maxsize=4)
+    _vision_subscribers[client_id] = q
+
+    def gen():
+        # Send current frame immediately so AI has context right away
+        first = _screen_frame or capture_screen()
+        b64 = base64.b64encode(first).decode()
+        yield f"event: frame\ndata: {b64}\n\n"
+        try:
+            while True:
+                try:
+                    frame = q.get(timeout=20)
+                    b64 = base64.b64encode(frame).decode()
+                    yield f"event: frame\ndata: {b64}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            _vision_subscribers.pop(client_id, None)
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Access-Control-Allow-Origin": "*"})
+
+@api.route("/vision/now")
+def api_vision_now():
+    """Current frame as raw JPEG — fastest possible, no encoding overhead."""
+    frame = _screen_frame or capture_screen()
+    return Response(frame, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store",
+                             "X-Frame-Width": "1920"})
 
 # Camera
 @api.route("/camera/snap")
@@ -1351,8 +1425,11 @@ _mcp_clients: dict = {}
 
 _MCP_TOOLS = [
     {"name":"screen_capture",
-     "description":"Take a screenshot. Returns the actual screen image so you can SEE what's on the PC.",
-     "inputSchema":{"type":"object","properties":{"region":{"type":"object","description":"Optional {x,y,w,h}","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}},"required":[]}},
+     "description":"Take a screenshot NOW. Returns the current screen as an image you can see directly. Use this to look at the screen at any moment.",
+     "inputSchema":{"type":"object","properties":{"region":{"type":"object","description":"Optional {x,y,w,h} crop","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}},"required":[]}},
+    {"name":"vision_latest",
+     "description":"Get the latest cached screen frame instantly — faster than screen_capture because it uses the already-captured background frame. No delay. Use this when you want to see the current state before or after an action.",
+     "inputSchema":{"type":"object","properties":{"region":{"type":"object","description":"Optional {x,y,w,h} crop"}},"required":[]}},
     {"name":"shell_exec",
      "description":"Run a shell/PowerShell command silently in the background. No terminal opens.",
      "inputSchema":{"type":"object","properties":{"cmd":{"type":"string"},"cwd":{"type":"string"},"timeout":{"type":"integer","default":30}},"required":["cmd"]}},
@@ -1443,16 +1520,24 @@ _MCP_TOOLS = [
     {"name":"camera_snap",
      "description":"Take a webcam photo. Returns the image.",
      "inputSchema":{"type":"object","properties":{"device":{"type":"integer","default":0}},"required":[]}},
+    {"name":"vision_subscribe",
+     "description":"Start CONTINUOUS PASSIVE VISION — screen frames will automatically arrive as notifications every time the screen changes, without you calling any tool. Call this ONCE at session start to give yourself always-on eyes. After subscribing, you will receive 'screen_update' notifications containing the screen image. You never need to call screen_capture again unless you want an on-demand shot.",
+     "inputSchema":{"type":"object","properties":{"change_only":{"type":"boolean","default":True,"description":"Only push frames when screen content changes (recommended). False = push every frame."}},"required":[]}},
+    {"name":"vision_unsubscribe",
+     "description":"Stop the continuous passive vision stream. Call this to stop receiving automatic screen updates.",
+     "inputSchema":{"type":"object","properties":{},"required":[]}},
 ]
 
 def _mcp_call_tool(name: str, args: dict) -> list:
     """Execute a tool call. Returns list of MCP content blocks."""
     try:
-        if name == "screen_capture":
-            frame = (_screen_frame if not args.get("region")
-                     else capture_screen(region=args["region"]))
-            if frame is None:
-                frame = capture_screen(region=args.get("region"))
+        if name in ("screen_capture", "vision_latest"):
+            region = args.get("region")
+            if region:
+                frame = capture_screen(region=region)
+            else:
+                # Use cached frame — instant, no capture delay
+                frame = _screen_frame or capture_screen()
             return [{"type":"image","data":base64.b64encode(frame).decode(),
                      "mimeType":"image/jpeg"}]
 
@@ -1637,6 +1722,77 @@ def _mcp_call_tool(name: str, args: dict) -> list:
             return [{"type":"image","data":base64.b64encode(frame).decode(),
                      "mimeType":"image/jpeg"}]
 
+        elif name == "vision_subscribe":
+            change_only = bool(args.get("change_only", True))
+            session_key = "global"
+            # Stop existing session if any
+            if session_key in _mcp_vision_sessions:
+                _mcp_vision_sessions[session_key]["stop"].set()
+                old_vsub = _mcp_vision_sessions[session_key].get("vsub_id")
+                if old_vsub:
+                    _vision_subscribers.pop(old_vsub, None)
+            # Create new vision queue for this session
+            vsub_id = uuid.uuid4().hex
+            vq: queue.Queue = queue.Queue(maxsize=6)
+            _vision_subscribers[vsub_id] = vq
+            stop_evt = threading.Event()
+            _mcp_vision_sessions[session_key] = {"stop": stop_evt, "vsub_id": vsub_id}
+
+            def _vision_push_thread(vq=vq, stop=stop_evt, vsub_id=vsub_id):
+                """Read frames from vision queue, push as MCP notifications to all clients."""
+                # Send initial frame immediately
+                try:
+                    first = _screen_frame or capture_screen(quality=65)
+                    b64 = base64.b64encode(first).decode()
+                    notif = {"jsonrpc":"2.0","method":"notifications/message",
+                             "params":{"level":"info","logger":"vision",
+                                       "data":{"type":"screen_update",
+                                               "image":{"type":"image","data":b64,
+                                                        "mimeType":"image/jpeg"}}}}
+                    for cq in list(_mcp_clients.values()):
+                        try: cq.put_nowait(notif)
+                        except queue.Full: pass
+                except Exception:
+                    pass
+                while not stop.is_set():
+                    try:
+                        frame = vq.get(timeout=20)
+                        b64 = base64.b64encode(frame).decode()
+                        notif = {"jsonrpc":"2.0","method":"notifications/message",
+                                 "params":{"level":"info","logger":"vision",
+                                           "data":{"type":"screen_update",
+                                                   "image":{"type":"image","data":b64,
+                                                            "mimeType":"image/jpeg"}}}}
+                        for cq in list(_mcp_clients.values()):
+                            try: cq.put_nowait(notif)
+                            except queue.Full: pass
+                    except queue.Empty:
+                        pass
+                    except Exception:
+                        pass
+                # Cleanup
+                _vision_subscribers.pop(vsub_id, None)
+                _log("Vision push thread stopped")
+
+            threading.Thread(target=_vision_push_thread, daemon=True).start()
+            _log(f"MCP passive vision started (change_only={change_only})")
+            return [{"type":"text","text":
+                     "Passive vision started. Screen frames will arrive as notifications/message "
+                     "whenever the screen changes. You now have continuous eyes — no need to call "
+                     "screen_capture. Frames arrive as: params.data.image (type/data/mimeType)."}]
+
+        elif name == "vision_unsubscribe":
+            session_key = "global"
+            if session_key in _mcp_vision_sessions:
+                _mcp_vision_sessions[session_key]["stop"].set()
+                vsub_id = _mcp_vision_sessions[session_key].get("vsub_id")
+                if vsub_id:
+                    _vision_subscribers.pop(vsub_id, None)
+                del _mcp_vision_sessions[session_key]
+                _log("MCP passive vision stopped")
+                return [{"type":"text","text":"Passive vision stopped."}]
+            return [{"type":"text","text":"No active vision session."}]
+
         else:
             return [{"type":"text","text":f"Unknown tool: {name}"}]
 
@@ -1655,7 +1811,7 @@ def _mcp_handle(msg: dict) -> dict | None:
 
     if method == "initialize":
         return ok({"protocolVersion":"2024-11-05",
-                   "capabilities":{"tools":{}},"serverInfo":{"name":"vyro-mcp","version":"3.0.0"}})
+                   "capabilities":{"tools":{},"logging":{}},"serverInfo":{"name":"vyro-mcp","version":"3.0.0"}})
     elif method == "initialized":
         return None
     elif method == "tools/list":
@@ -1956,7 +2112,8 @@ class Dashboard:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-        self.lbl_reqs.config(text=f"Requests: {_request_count}  |  Events: {len(_event_queue)}")
+        self.lbl_reqs.config(
+            text=f"Requests: {_request_count}  |  Events: {len(_event_queue)}  |  Vision: {len(_vision_subscribers)} subscriber(s)")
         try:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
@@ -2023,8 +2180,8 @@ if __name__ == "__main__":
     api_thread = threading.Thread(target=_run_api, daemon=True)
     api_thread.start()
     time.sleep(0.5)
-    _log(f"API ready → http://localhost:{_api_port}")
-    _log(f"MCP endpoint → http://localhost:{_api_port}/mcp")
+    _log(f"API ready at http://localhost:{_api_port}")
+    _log(f"MCP endpoint at http://localhost:{_api_port}/mcp")
 
     # Start GUI on main thread
     dash = Dashboard()
