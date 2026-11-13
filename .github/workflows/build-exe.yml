@@ -61,9 +61,7 @@ jobs:
           $tag = "v3.0.0"
           $exists = gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag `
-              --title "vyro-mcp v3.0.0 - Advanced Windows AI Control Server" `
-              --notes-file .github/workflows/release-notes.md
+            gh release create $tag --title "vyro-mcp v3.0.0" --notes "Full Windows AI Control Server. 33 tools. Run as Administrator. GUI opens on start. Click Start Tunnel for public HTTPS URL. Add /mcp as MCP server in Claude Desktop."
           }
           gh release upload $tag dist\vyro-mcp.exe --clobber
         env:
